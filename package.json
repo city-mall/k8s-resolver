@@ -9,7 +9,6 @@
   "author": "Arkadev Banerjee",
   "license": "ISC",
   "dependencies": {
-    "@citymallservices/k8s-grpc-resolver": "^1.0.0",
     "@grpc/grpc-js": "^1.8.17",
     "@kubernetes/client-node": "^0.18.1",
     "cockatiel": "^1.1.1"
