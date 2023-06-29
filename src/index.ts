@@ -101,7 +101,11 @@ export class K8sResolover implements Resolver {
     console.log("[K8sResolover] Resolver destroy");
 
     if (this.informer) {
-      this.informer.stop();
+      this.informer
+        .stop()
+        .catch((err) =>
+          console.error(`[K8sResolover] informer stop error`, err)
+        );
     }
   }
 
