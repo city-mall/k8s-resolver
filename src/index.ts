@@ -1,6 +1,7 @@
 import { ChannelOptions, Metadata, StatusObject } from "@grpc/grpc-js";
 import { LogVerbosity, Status } from "@grpc/grpc-js/build/src/constants";
 import * as logging from "@grpc/grpc-js/build/src/logging";
+import * as http from "http";
 import {
   Resolver,
   ResolverListener,
@@ -206,12 +207,20 @@ export class K8sResolover implements Resolver {
           err
         )}`
       );
-      setTimeout(() => informer.start(), this.backoff!.duration());
+      setTimeout(
+        () =>
+          informer
+            .start()
+            .catch((err) => console.error(`[K8sResolover] Error`, err)),
+        this.backoff!.duration()
+      );
     });
 
     this.informer = informer;
 
-    return this.informer.start();
+    return this.informer
+      .start()
+      .catch((err) => console.error(`[K8sResolover] Error`, err));
   }
 
   private updateResolutionFromAddress() {
@@ -240,14 +249,24 @@ export class K8sResolover implements Resolver {
     }));
   }
 
-  private async fetchEndpoints() {
-    return k8sApi.listNamespacedEndpoints(
-      this.namespace,
-      undefined,
-      undefined,
-      undefined,
-      `${fieldSelectorPrefix}${this.serviceName}`
-    );
+  private async fetchEndpoints(): Promise<{
+    response: http.IncomingMessage;
+    body: k8s.V1EndpointsList;
+  }> {
+    try {
+      const r = await k8sApi.listNamespacedEndpoints(
+        this.namespace,
+        undefined,
+        undefined,
+        undefined,
+        `${fieldSelectorPrefix}${this.serviceName}`
+      );
+      return r;
+    } catch (err) {
+      console.error(`[K8sResolover] fetchEndpoints error`, err);
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      return this.fetchEndpoints();
+    }
   }
 
   private handleFullUpdate(subsets: k8s.V1EndpointSubset[]) {
