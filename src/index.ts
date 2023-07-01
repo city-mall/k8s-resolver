@@ -87,7 +87,7 @@ export class K8sResolover implements Resolver {
       metadata: new Metadata(),
     };
 
-    this.watch();
+    this.watch().catch((err) => console.log(`[K8sResolover] watch error`, err));
   }
 
   // only report error if has
@@ -110,7 +110,7 @@ export class K8sResolover implements Resolver {
     }
   }
 
-  private watch() {
+  private async watch() {
     // watch endpoints by namespace and service name
     const informer = k8s.makeInformer(
       kc,
