@@ -52,8 +52,8 @@ export class K8sResolover implements Resolver {
   private defaultResolutionError: StatusObject | undefined;
 
   private namespace: string;
-  private port: number;
-  private serviceName: string;
+  private port: number | undefined;
+  private serviceName: string | undefined;
   private addresses = new Set<string>();
   private informer: k8s.Informer<k8s.V1Endpoints> | undefined;
 
@@ -69,8 +69,8 @@ export class K8sResolover implements Resolver {
     console.log("[K8sResolover] Resolver constructed");
     this.namespace = target.authority || "default";
     const hostPort = splitHostPort(target.path);
-    this.serviceName = hostPort!.host;
-    this.port = hostPort!.port!;
+    this.serviceName = hostPort?.host;
+    this.port = hostPort?.port;
 
     if (!this.serviceName || !this.port) {
       this.error = {
@@ -122,8 +122,8 @@ export class K8sResolover implements Resolver {
       this.resetBackoff();
 
       let changed = false;
-      for (const sub of obj.subsets!) {
-        for (const point of sub.addresses!) {
+      for (const sub of obj.subsets || []) {
+        for (const point of sub.addresses || []) {
           if (!this.addresses.has(point.ip)) {
             this.addresses.add(point.ip);
             changed = true;
@@ -149,8 +149,8 @@ export class K8sResolover implements Resolver {
       this.resetBackoff();
 
       let changed = false;
-      for (const sub of obj.subsets!) {
-        for (const point of sub.addresses!) {
+      for (const sub of obj.subsets || []) {
+        for (const point of sub.addresses || []) {
           if (this.addresses.has(point.ip)) {
             this.addresses.delete(point.ip);
             changed = true;
@@ -177,7 +177,7 @@ export class K8sResolover implements Resolver {
     informer.on("update", (obj) => {
       this.resetBackoff();
 
-      this.handleFullUpdate(obj.subsets!);
+      this.handleFullUpdate(obj.subsets || []);
 
       this.trace(`informer update event, obj: ${JSON.stringify(obj)}`);
       console.log(
@@ -188,7 +188,9 @@ export class K8sResolover implements Resolver {
     // informer will not restart when the under watcher got error
     // so we restart the informer ourselves
     informer.on("error", (err: any) => {
-      this.listener.onError(this.defaultResolutionError!);
+      if (this.defaultResolutionError) {
+        this.listener.onError(this.defaultResolutionError);
+      }
 
       if (!this.backoff) {
         this.backoff = backoffFactory.next(null as any);
@@ -197,22 +199,22 @@ export class K8sResolover implements Resolver {
       }
 
       this.trace(
-        `informer error event, will restart informer, backoff duration: ${this.backoff!.duration()}, err: ${JSON.stringify(
-          err
-        )}`
+        `informer error event, will restart informer, backoff duration: ${
+          this.backoff?.duration() || 0
+        }, err: ${JSON.stringify(err)}`
       );
 
       console.log(
-        `[K8sResolover] informer error event, will restart informer, backoff duration: ${this.backoff!.duration()}, err: ${JSON.stringify(
-          err
-        )}`
+        `[K8sResolover] informer error event, will restart informer, backoff duration: ${
+          this.backoff?.duration() || 0
+        }, err: ${JSON.stringify(err)}`
       );
       setTimeout(
         () =>
           informer
             .start()
             .catch((err) => console.error(`[K8sResolover] Error`, err)),
-        this.backoff!.duration()
+        this.backoff?.duration() || 0
       );
     });
 
@@ -245,7 +247,7 @@ export class K8sResolover implements Resolver {
   private addressToSubchannelAddress(): SubchannelAddress[] {
     return [...this.addresses.keys()].map((addr) => ({
       host: addr,
-      port: this.port,
+      port: this.port!,
     }));
   }
 
@@ -272,7 +274,7 @@ export class K8sResolover implements Resolver {
   private handleFullUpdate(subsets: k8s.V1EndpointSubset[]) {
     const newAddressesSet = new Set<string>();
     for (const sub of subsets) {
-      for (const point of sub.addresses!) {
+      for (const point of sub.addresses || []) {
         if (!newAddressesSet.has(point.ip)) {
           newAddressesSet.add(point.ip);
         }
