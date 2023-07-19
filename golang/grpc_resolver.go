@@ -9,7 +9,7 @@ import (
 	r "google.golang.org/grpc/resolver"
 )
 
-const K8sScheme = "k8s"
+const k8sScheme = "k8s"
 
 // Short Note on UpdateState
 // UpdateState updates the state of the ClientConn appropriately.
@@ -23,7 +23,7 @@ const K8sScheme = "k8s"
 // If the resolved State is the same as the last reported one, calling
 // UpdateState can be omitted.
 
-type K8sResolverBuilder struct {
+type k8sResolverBuilder struct {
 }
 
 type k8sEventDrivenResolver struct {
@@ -49,7 +49,7 @@ func (k *k8sEventDrivenResolver) Close() {
 //
 // gRPC dial calls Build synchronously, and fails if the returned error is
 // not nil.
-func (b *K8sResolverBuilder) Build(target r.Target, cc r.ClientConn, opts r.BuildOptions) (r.Resolver, error) {
+func (b *k8sResolverBuilder) Build(target r.Target, cc r.ClientConn, opts r.BuildOptions) (r.Resolver, error) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	namespace := target.URL.Hostname()
@@ -83,8 +83,8 @@ func (b *K8sResolverBuilder) Build(target r.Target, cc r.ClientConn, opts r.Buil
 // at https://github.com/grpc/grpc/blob/master/doc/naming.md.  The returned
 // string should not contain uppercase characters, as they will not match
 // the parsed target's scheme as defined in RFC 3986.
-func (b *K8sResolverBuilder) Scheme() string {
-	return K8sScheme
+func (b *k8sResolverBuilder) Scheme() string {
+	return k8sScheme
 }
 
 func Try(address string) string {
@@ -97,7 +97,11 @@ func Try(address string) string {
 		serviceName := serviceNameServiceNs[0]
 		serviceNs := serviceNameServiceNs[1]
 
-		address = fmt.Sprintf("%s://%s/%s:%s", K8sScheme, serviceNs, serviceName, servicePort)
+		address = fmt.Sprintf("%s://%s/%s:%s", k8sScheme, serviceNs, serviceName, servicePort)
 	}
 	return address
+}
+
+func Builder() r.Builder {
+	return &k8sResolverBuilder{}
 }
