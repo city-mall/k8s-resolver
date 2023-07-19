@@ -87,7 +87,8 @@ func (b *K8sResolverBuilder) Scheme() string {
 	return K8sScheme
 }
 
-func Try(address string) string {
+func Try(address string) (string, bool) {
+	var ok bool
 	if strings.Contains(address, "svc.cluster.local") {
 		hostServicePort := strings.Split(address, ":")
 		host := hostServicePort[0]
@@ -98,6 +99,7 @@ func Try(address string) string {
 		serviceNs := serviceNameServiceNs[1]
 
 		address = fmt.Sprintf("%s://%s/%s:%s", K8sScheme, serviceNs, serviceName, servicePort)
+		ok = true
 	}
-	return address
+	return address, ok
 }
