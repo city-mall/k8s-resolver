@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/rs/zerolog/log"
 	r "google.golang.org/grpc/resolver"
 )
 
@@ -58,7 +59,10 @@ func (b *k8sResolverBuilder) Build(target r.Target, cc r.ClientConn, opts r.Buil
 	serviceName := service[:idx]
 	port := service[idx+1:]
 	notifier := make(chan struct{})
-	resolver := newInternalResolver(context.Background(), serviceName, namespace, notifier)
+	resolver, err := newInternalResolver(context.Background(), serviceName, namespace, notifier)
+	if err != nil {
+		return nil, err
+	}
 	go func() {
 		for range notifier {
 			ips := resolver.getIPs()
@@ -67,7 +71,7 @@ func (b *k8sResolverBuilder) Build(target r.Target, cc r.ClientConn, opts r.Buil
 				addresses = append(addresses, r.Address{Addr: ip + ":" + port})
 			}
 			if err := cc.UpdateState(r.State{Addresses: addresses}); err != nil {
-				panic(err)
+				log.Err(err).Msgf("failed to update state")
 			}
 		}
 	}()
