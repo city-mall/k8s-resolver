@@ -23,19 +23,19 @@ type internalResolver struct {
 	stop      chan struct{}
 }
 
-func newInternalResolver(ctx context.Context, service string, namespace string, notify chan struct{}) *internalResolver {
+func newInternalResolver(ctx context.Context, service string, namespace string, notify chan struct{}) (*internalResolver, error) {
 	var r internalResolver
 	r.addresses = make(map[string]bool)
 	r.ctx = ctx
 
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 
 	informer := cache.NewSharedIndexInformer(
@@ -87,7 +87,7 @@ func newInternalResolver(ctx context.Context, service string, namespace string, 
 
 	r.informer = informer
 
-	return &r
+	return &r, nil
 }
 
 func (r *internalResolver) start(wg *sync.WaitGroup) {
