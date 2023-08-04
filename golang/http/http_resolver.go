@@ -28,6 +28,11 @@ type Resolver struct {
 	podAddressMap map[string]string
 	cb            func(oldIp string, newIp string)
 	tb            func(ip string)
+
+	service     string
+	namespace   string
+	clientset   *kubernetes.Clientset
+	sigInformer cache.SharedIndexInformer
 }
 
 type CreateResolverOptions struct {
@@ -79,6 +84,9 @@ func NewResolver(op CreateResolverOptions) *Resolver {
 	service := serviceNameServiceNs[0]
 	namespace := serviceNameServiceNs[1]
 
+	r.service = service
+	r.namespace = namespace
+
 	defer op.Waiter.Done()
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -88,6 +96,11 @@ func NewResolver(op CreateResolverOptions) *Resolver {
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		panic(err.Error())
+	}
+	r.clientset = clientset
+
+	if op.TerminateCallback != nil {
+		r.initSigtermInformer()
 	}
 
 	informer := cache.NewSharedIndexInformer(
@@ -133,12 +146,51 @@ func NewResolver(op CreateResolverOptions) *Resolver {
 	return &r
 }
 
+func (r *Resolver) initSigtermInformer() {
+	cctx, cancel := context.WithCancel(r.ctx)
+	defer cancel()
+
+	informer := cache.NewSharedIndexInformer(
+		&cache.ListWatch{
+			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+				options.FieldSelector = "metadata.name=" + r.service
+				return r.clientset.CoreV1().Endpoints(r.namespace).List(cctx, options)
+			},
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+				options.FieldSelector = "metadata.name=" + r.service
+				return r.clientset.CoreV1().Endpoints(r.namespace).Watch(cctx, options)
+			},
+		},
+		&v1.Pod{},
+		0,
+		cache.Indexers{},
+	)
+
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			oldPod, ok1 := oldObj.(*v1.Pod)
+			newPod, ok2 := newObj.(*v1.Pod)
+			if ok1 && ok2 && oldPod.ObjectMeta.DeletionTimestamp.IsZero() && !newPod.ObjectMeta.DeletionTimestamp.IsZero() {
+				log.Debug().Str("Component", "Resolver").Msgf("Pod Received SIGTERM: %s Ip: %v", newPod.Name, newPod.Status.PodIP)
+				r.tb(newPod.Status.PodIP)
+			}
+		},
+	})
+
+	r.sigInformer = informer
+}
+
 func (r *Resolver) Start() {
 	stop := make(chan struct{})
 	go r.informer.Run(stop)
+	sigStop := make(chan struct{})
+	if r.sigInformer != nil {
+		go r.sigInformer.Run(stop)
+	}
 
 	<-r.ctx.Done()
 	close(stop)
+	close(sigStop)
 }
 
 func (r *Resolver) handleUpsert(subsets []v1.EndpointSubset) {
