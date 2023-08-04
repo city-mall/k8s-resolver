@@ -19,52 +19,29 @@ type Resolver struct {
 	mu  sync.Mutex
 	url string
 
-	ctx           context.Context
-	informer      cache.SharedIndexInformer
-	index         int
-	resolvable    bool
-	servicePort   string
-	addresses     map[string]bool
-	podAddressMap map[string]string
-	cb            func(oldIp string, newIp string)
-	tb            func(ip string)
-
-	service     string
-	namespace   string
-	clientset   *kubernetes.Clientset
-	sigInformer cache.SharedIndexInformer
+	ctx         context.Context
+	informer    cache.SharedIndexInformer
+	index       int
+	resolvable  bool
+	servicePort string
+	addresses   map[string]bool
+	addCh       chan<- string
+	delCh       chan<- string
 }
 
 type CreateResolverOptions struct {
-	Context           context.Context
-	Url               string
-	Waiter            *sync.WaitGroup
-	UpdateCallback    func(oldIp string, newIp string)
-	TerminateCallback func(ip string)
+	Context context.Context
+	Url     string
+	Waiter  *sync.WaitGroup
+	AddChan chan<- string
+	DelChan chan<- string
 }
 
 func NewResolver(op CreateResolverOptions) *Resolver {
-
-	cctx, cancel := context.WithCancel(op.Context)
-	defer cancel()
-
 	var r Resolver
 	r.url = op.Url
 
-	if op.UpdateCallback != nil {
-		r.cb = op.UpdateCallback
-	} else {
-		r.cb = func(oldIp string, newIp string) {}
-	}
-
-	if op.TerminateCallback != nil {
-		r.tb = op.TerminateCallback
-	} else {
-		r.tb = func(ip string) {}
-	}
-
 	r.addresses = make(map[string]bool)
-	r.podAddressMap = make(map[string]string)
 
 	if !strings.Contains(op.Url, "svc.cluster.local") {
 		r.resolvable = false
@@ -72,7 +49,9 @@ func NewResolver(op CreateResolverOptions) *Resolver {
 	}
 
 	r.resolvable = true
-	r.ctx = cctx
+	r.ctx = op.Context
+	r.addCh = op.AddChan
+	r.delCh = op.DelChan
 
 	url := strings.ReplaceAll(op.Url, "http://", "")
 	hostServicePort := strings.Split(url, ":")
@@ -84,9 +63,6 @@ func NewResolver(op CreateResolverOptions) *Resolver {
 	service := serviceNameServiceNs[0]
 	namespace := serviceNameServiceNs[1]
 
-	r.service = service
-	r.namespace = namespace
-
 	defer op.Waiter.Done()
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -97,21 +73,16 @@ func NewResolver(op CreateResolverOptions) *Resolver {
 	if err != nil {
 		panic(err.Error())
 	}
-	r.clientset = clientset
-
-	if op.TerminateCallback != nil {
-		r.initSigtermInformer()
-	}
 
 	informer := cache.NewSharedIndexInformer(
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 				options.FieldSelector = "metadata.name=" + service
-				return clientset.CoreV1().Endpoints(namespace).List(cctx, options)
+				return clientset.CoreV1().Endpoints(namespace).List(op.Context, options)
 			},
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 				options.FieldSelector = "metadata.name=" + service
-				return clientset.CoreV1().Endpoints(namespace).Watch(cctx, options)
+				return clientset.CoreV1().Endpoints(namespace).Watch(op.Context, options)
 			},
 		},
 		&v1.Endpoints{},
@@ -146,88 +117,62 @@ func NewResolver(op CreateResolverOptions) *Resolver {
 	return &r
 }
 
-func (r *Resolver) initSigtermInformer() {
-	cctx, cancel := context.WithCancel(r.ctx)
-	defer cancel()
-
-	informer := cache.NewSharedIndexInformer(
-		&cache.ListWatch{
-			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-				options.FieldSelector = "metadata.name=" + r.service
-				return r.clientset.CoreV1().Endpoints(r.namespace).List(cctx, options)
-			},
-			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-				options.FieldSelector = "metadata.name=" + r.service
-				return r.clientset.CoreV1().Endpoints(r.namespace).Watch(cctx, options)
-			},
-		},
-		&v1.Pod{},
-		0,
-		cache.Indexers{},
-	)
-
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			oldPod, ok1 := oldObj.(*v1.Pod)
-			newPod, ok2 := newObj.(*v1.Pod)
-			if ok1 && ok2 && oldPod.ObjectMeta.DeletionTimestamp.IsZero() && !newPod.ObjectMeta.DeletionTimestamp.IsZero() {
-				log.Debug().Str("Component", "Resolver").Msgf("Pod Received SIGTERM: %s Ip: %v", newPod.Name, newPod.Status.PodIP)
-				r.tb(newPod.Status.PodIP)
-			}
-		},
-	})
-
-	r.sigInformer = informer
-}
-
 func (r *Resolver) Start() {
 	stop := make(chan struct{})
 	go r.informer.Run(stop)
-	sigStop := make(chan struct{})
-	if r.sigInformer != nil {
-		go r.sigInformer.Run(stop)
-	}
-
 	<-r.ctx.Done()
 	close(stop)
-	close(sigStop)
+	close(r.addCh)
+	close(r.delCh)
+}
+
+func diff(a, b map[string]bool) []string {
+	difference := make([]string, 0)
+	for key := range a {
+		if _, ok := b[key]; !ok {
+			difference = append(difference, key)
+		}
+	}
+	return difference
 }
 
 func (r *Resolver) handleUpsert(subsets []v1.EndpointSubset) {
 	r.mu.Lock()
 
 	addedIps := make([]string, 0)
-	updatedIps := make([]string, 0)
+	deletedIps := make([]string, 0)
 	addresses := make(map[string]bool)
-	podAddressMap := make(map[string]string)
-	newToOld := make(map[string]string)
 
 	for _, sub := range subsets {
 		for _, point := range sub.Addresses {
-			podName := point.TargetRef.Name
 			if _, ok := r.addresses[point.IP]; !ok {
 				addedIps = append(addedIps, point.IP)
-			} else {
-				newToOld[point.IP] = r.podAddressMap[podName]
-				updatedIps = append(updatedIps, point.IP)
 			}
 			addresses[point.IP] = true
-			podAddressMap[podName] = point.IP
 		}
 	}
 
+	if len(addresses) < len(r.addresses) {
+		deletedIps = diff(r.addresses, addresses)
+	}
+
 	r.addresses = addresses
-	r.podAddressMap = podAddressMap
 	r.mu.Unlock()
 
-	for _, ip := range addedIps {
-		r.cb("", ip)
+	if r.delCh != nil {
+		for _, ip := range deletedIps {
+			log.Debug().Msgf("DELETE %v", ip)
+			r.delCh <- ip
+		}
 	}
-	for _, ip := range updatedIps {
-		r.cb(newToOld[ip], ip)
+	if r.addCh != nil {
+		for _, ip := range addedIps {
+			log.Debug().Msgf("ADD %v", ip)
+			r.addCh <- ip
+		}
 	}
 
-	log.Debug().Str("Component", "Resolver.handleUpsert").Msgf("New address list: %v", addresses)
+	log.Debug().Str("Component", "Resolver.handleUpsert").Msgf("New address list: %v", len(addresses))
 }
 
 func (r *Resolver) handleDelete(subsets []v1.EndpointSubset) {
@@ -238,18 +183,20 @@ func (r *Resolver) handleDelete(subsets []v1.EndpointSubset) {
 	for _, sub := range subsets {
 		for _, point := range sub.Addresses {
 			delete(r.addresses, point.IP)
-			delete(r.podAddressMap, point.TargetRef.Name)
 			deletedIps = append(deletedIps, point.IP)
 		}
 	}
 
 	r.mu.Unlock()
 
-	for _, ip := range deletedIps {
-		r.cb(ip, "")
+	if r.delCh != nil {
+		for _, ip := range deletedIps {
+			log.Debug().Msgf("DELETE %v", ip)
+			r.delCh <- ip
+		}
 	}
 
-	log.Debug().Str("Component", "Resolver.handleDelete").Msgf("New address list: %v", r.addresses)
+	log.Debug().Str("Component", "Resolver.handleDelete").Msgf("New address list: %v", len(r.addresses))
 }
 
 func (r *Resolver) GetAddress() string {
