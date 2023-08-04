@@ -25,12 +25,22 @@ type Resolver struct {
 	resolvable  bool
 	servicePort string
 	addresses   map[string]bool
+	cb          func(et ResolverEventType, affectedIp string)
 }
 
-func NewResolver(ctx context.Context, url string, wg *sync.WaitGroup) *Resolver {
+type ResolverEventType int
+
+const (
+	ADD    ResolverEventType = iota
+	UPDATE ResolverEventType = 1
+	DELETE ResolverEventType = 2
+)
+
+func NewResolver(ctx context.Context, url string, wg *sync.WaitGroup, cb func(eventType ResolverEventType, affectedIp string)) *Resolver {
 
 	var r Resolver
 	r.url = url
+	r.cb = cb
 	r.addresses = make(map[string]bool)
 
 	if !strings.Contains(url, "svc.cluster.local") {
@@ -115,27 +125,51 @@ func (r *Resolver) Start() {
 
 func (r *Resolver) handleUpsert(subsets []v1.EndpointSubset) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+
+	addedIps := make([]string, 0)
+	updatedIps := make([]string, 0)
 
 	addresses := make(map[string]bool)
 	for _, sub := range subsets {
 		for _, point := range sub.Addresses {
+			if _, ok := r.addresses[point.IP]; !ok {
+				addedIps = append(addedIps, point.IP)
+			} else {
+				updatedIps = append(updatedIps, point.IP)
+			}
 			addresses[point.IP] = true
 		}
 	}
 
 	r.addresses = addresses
+	r.mu.Unlock()
+
+	for _, ip := range addedIps {
+		r.cb(ADD, ip)
+	}
+	for _, ip := range updatedIps {
+		r.cb(UPDATE, ip)
+	}
+
 	log.Debug().Str("Component", "Resolver.handleUpsert").Msgf("New address list: %v", addresses)
 }
 
 func (r *Resolver) handleDelete(subsets []v1.EndpointSubset) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+
+	deletedIps := make([]string, 0)
 
 	for _, sub := range subsets {
 		for _, point := range sub.Addresses {
 			delete(r.addresses, point.IP)
+			deletedIps = append(deletedIps, point.IP)
 		}
+	}
+
+	r.mu.Unlock()
+
+	for _, ip := range deletedIps {
+		r.cb(DELETE, ip)
 	}
 
 	log.Debug().Str("Component", "Resolver.handleDelete").Msgf("New address list: %v", r.addresses)
@@ -166,4 +200,14 @@ func (r *Resolver) GetAddress() string {
 	url := "http://" + list[idx] + ":" + r.servicePort
 	log.Debug().Str("Component", "Resolver.GetAddress").Msgf("Serving \"%s\" from \"%s\"", r.url, url)
 	return url
+}
+
+func (r *Resolver) GetAddressList() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	list := make([]string, 0, len(r.addresses))
+	for k := range r.addresses {
+		list = append(list, k)
+	}
+	return list
 }
