@@ -172,13 +172,13 @@ func (r *Resolver) handleUpsert(subsets []v1.EndpointSubset) {
 	if r.delCh != nil {
 		for _, ip := range deletedIps {
 			log.Debug().Msgf("DELETE %v", ip)
-			r.delCh <- ip
+			r.delCh <- ip + ":" + r.servicePort
 		}
 	}
 	if r.addCh != nil {
 		for _, ip := range addedIps {
 			log.Debug().Msgf("ADD %v", ip)
-			r.addCh <- ip
+			r.addCh <- ip + ":" + r.servicePort
 		}
 	}
 
@@ -202,7 +202,7 @@ func (r *Resolver) handleDelete(subsets []v1.EndpointSubset) {
 	if r.delCh != nil {
 		for _, ip := range deletedIps {
 			log.Debug().Msgf("DELETE %v", ip)
-			r.delCh <- ip
+			r.delCh <- ip + ":" + r.servicePort
 		}
 	}
 
