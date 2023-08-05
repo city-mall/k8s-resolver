@@ -37,7 +37,17 @@ type CreateResolverOptions struct {
 	DelChan chan<- string
 }
 
-func NewResolver(op CreateResolverOptions) *Resolver {
+func NewResolver(ctx context.Context, url string, wg *sync.WaitGroup) *Resolver {
+	return NewResolverWithOptions(CreateResolverOptions{
+		Context: ctx,
+		Url:     url,
+		Waiter:  wg,
+		AddChan: nil,
+		DelChan: nil,
+	})
+}
+
+func NewResolverWithOptions(op CreateResolverOptions) *Resolver {
 	var r Resolver
 	r.url = op.Url
 
