@@ -1,1 +1,1 @@
-# k8s-grpc-resolver
+# k8s-resolver
