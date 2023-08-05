@@ -147,6 +147,10 @@ func diff(a, b map[string]bool) []string {
 }
 
 func (r *Resolver) handleUpsert(subsets []v1.EndpointSubset) {
+	if err := r.ctx.Err(); err != nil {
+		log.Debug().Str("Component", "Resolver.handleUpsert").Msgf("Context error: %v", err)
+		return
+	}
 	r.mu.Lock()
 
 	addedIps := make([]string, 0)
@@ -186,6 +190,10 @@ func (r *Resolver) handleUpsert(subsets []v1.EndpointSubset) {
 }
 
 func (r *Resolver) handleDelete(subsets []v1.EndpointSubset) {
+	if err := r.ctx.Err(); err != nil {
+		log.Debug().Str("Component", "Resolver.handleDelete").Msgf("Context error: %v", err)
+		return
+	}
 	r.mu.Lock()
 
 	deletedIps := make([]string, 0)
