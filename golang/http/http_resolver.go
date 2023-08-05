@@ -241,7 +241,7 @@ func (r *Resolver) GetAddressList() []string {
 	defer r.mu.Unlock()
 	list := make([]string, 0, len(r.addresses))
 	for k := range r.addresses {
-		list = append(list, k)
+		list = append(list, k+":"+r.servicePort)
 	}
 	return list
 }
