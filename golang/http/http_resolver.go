@@ -19,7 +19,6 @@ type Resolver struct {
 	mu  sync.Mutex
 	url string
 
-	ctx         context.Context
 	informer    cache.SharedIndexInformer
 	index       int
 	resolvable  bool
@@ -59,7 +58,6 @@ func NewResolverWithOptions(op CreateResolverOptions) *Resolver {
 	}
 
 	r.resolvable = true
-	r.ctx = op.Context
 	r.addCh = op.AddChan
 	r.delCh = op.DelChan
 
@@ -88,11 +86,11 @@ func NewResolverWithOptions(op CreateResolverOptions) *Resolver {
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 				options.FieldSelector = "metadata.name=" + service
-				return clientset.CoreV1().Endpoints(namespace).List(op.Context, options)
+				return clientset.CoreV1().Endpoints(namespace).List(context.Background(), options)
 			},
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 				options.FieldSelector = "metadata.name=" + service
-				return clientset.CoreV1().Endpoints(namespace).Watch(op.Context, options)
+				return clientset.CoreV1().Endpoints(namespace).Watch(context.Background(), options)
 			},
 		},
 		&v1.Endpoints{},
@@ -129,11 +127,7 @@ func NewResolverWithOptions(op CreateResolverOptions) *Resolver {
 
 func (r *Resolver) Start() {
 	stop := make(chan struct{})
-	go r.informer.Run(stop)
-	<-r.ctx.Done()
-	close(stop)
-	close(r.addCh)
-	close(r.delCh)
+	r.informer.Run(stop)
 }
 
 func diff(a, b map[string]bool) []string {
@@ -147,10 +141,6 @@ func diff(a, b map[string]bool) []string {
 }
 
 func (r *Resolver) handleUpsert(subsets []v1.EndpointSubset) {
-	if err := r.ctx.Err(); err != nil {
-		log.Debug().Str("Component", "Resolver.handleUpsert").Msgf("Context error: %v", err)
-		return
-	}
 	r.mu.Lock()
 
 	addedIps := make([]string, 0)
@@ -190,10 +180,6 @@ func (r *Resolver) handleUpsert(subsets []v1.EndpointSubset) {
 }
 
 func (r *Resolver) handleDelete(subsets []v1.EndpointSubset) {
-	if err := r.ctx.Err(); err != nil {
-		log.Debug().Str("Component", "Resolver.handleDelete").Msgf("Context error: %v", err)
-		return
-	}
 	r.mu.Lock()
 
 	deletedIps := make([]string, 0)
