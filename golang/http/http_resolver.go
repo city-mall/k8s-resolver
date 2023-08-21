@@ -27,6 +27,7 @@ type PodEvent struct {
 	Phase    string
 	Name     string
 	Message  string
+	IP       string
 }
 
 func (p *PodEvent) String() string {
@@ -158,6 +159,7 @@ func getEventFromPod(pod *v1.Pod, operator string) PodEvent {
 	event.Reason = string(pod.Status.Reason)
 	event.Message = pod.Status.Message
 	event.Operator = operator
+	event.IP = pod.Status.PodIP
 	return event
 }
 
