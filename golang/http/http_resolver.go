@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog/log"
 	v1 "k8s.io/api/core/v1"
@@ -23,15 +24,11 @@ const (
 
 type PodEvent struct {
 	Operator string
+	Type     string
 	Reason   string
-	Phase    string
 	Name     string
 	Message  string
 	IP       string
-}
-
-func (p *PodEvent) String() string {
-	return "Operator:" + p.Operator + " Reason: " + p.Reason + " Phase: " + p.Phase + " Name: " + p.Name + " Message: " + p.Message
 }
 
 type Resolver struct {
@@ -152,50 +149,89 @@ func NewResolverWithOptions(op CreateResolverOptions) *Resolver {
 	return &r
 }
 
-func getEventFromPod(pod *v1.Pod, operator string) PodEvent {
-	var event PodEvent
-	event.Name = pod.Name
-	event.Phase = string(pod.Status.Phase)
-	event.Reason = string(pod.Status.Reason)
-	event.Message = pod.Status.Message
-	event.Operator = operator
-	event.IP = pod.Status.PodIP
-	return event
+func getEventFromPod(event *v1.Event, pod *v1.Pod, operator string) PodEvent {
+	var ev PodEvent
+	ev.Name = event.InvolvedObject.Name
+	ev.Type = event.Type
+	ev.Reason = event.Reason
+	ev.Operator = operator
+	ev.Message = event.Message
+	if pod != nil {
+		ev.IP = pod.Status.PodIP
+	}
+	return ev
+}
+
+func (r *Resolver) getPod(event *v1.Event, startTime time.Time) *v1.Pod {
+	if event.CreationTimestamp.Time.Before(startTime) {
+		return nil
+	}
+	pod, err := r.clientset.CoreV1().Pods(r.namespace).Get(context.Background(), event.InvolvedObject.Name, metav1.GetOptions{})
+	if err != nil {
+		log.Err(err).Msgf("error getting detail for pod %v", event.InvolvedObject.Name)
+	}
+	return pod
+}
+
+func (r *Resolver) validateEvent(event *v1.Event, startTime time.Time) bool {
+	if !strings.HasPrefix(event.InvolvedObject.Name, r.service) {
+		return false
+	}
+	if event.InvolvedObject.Kind != "Pod" {
+		return false
+	}
+	if event.CreationTimestamp.Time.Before(startTime) {
+		return false
+	}
+
+	return true
 }
 
 func (r *Resolver) listenPodEvents(ch chan<- PodEvent) {
-	informer := cache.NewSharedIndexInformer(
+	startTime := time.Now()
+
+	eventsInformer := cache.NewSharedInformer(
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-				options.FieldSelector = "metadata.name=" + r.service
-				return r.clientset.CoreV1().Endpoints(r.namespace).List(context.Background(), options)
+				return r.clientset.CoreV1().Events(r.namespace).List(context.TODO(), options)
 			},
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-				options.FieldSelector = "metadata.name=" + r.service
-				return r.clientset.CoreV1().Endpoints(r.namespace).Watch(context.Background(), options)
+				return r.clientset.CoreV1().Events(r.namespace).Watch(context.TODO(), options)
 			},
 		},
-		&v1.Pod{},
+		&v1.Event{},
 		0,
-		cache.Indexers{},
 	)
 
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	eventsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			ch <- getEventFromPod(obj.(*v1.Pod), OperatorAdd)
-		},
-		DeleteFunc: func(obj interface{}) {
-			ch <- getEventFromPod(obj.(*v1.Pod), OperatorDelete)
-		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			oldPod := oldObj.(*v1.Pod)
-			newPod := newObj.(*v1.Pod)
-			if oldPod.ResourceVersion == newPod.ResourceVersion {
+			event := obj.(*v1.Event)
+			if ok := r.validateEvent(event, startTime); !ok {
 				return
 			}
-			ch <- getEventFromPod(newObj.(*v1.Pod), OperatorUpdate)
+			ch <- getEventFromPod(event, r.getPod(event, startTime), OperatorAdd)
+		},
+		UpdateFunc: func(_, newObj interface{}) {
+			event := newObj.(*v1.Event)
+			if ok := r.validateEvent(event, startTime); !ok {
+				return
+			}
+			ch <- getEventFromPod(event, r.getPod(event, startTime), OperatorUpdate)
+		},
+		DeleteFunc: func(obj interface{}) {
+			event := obj.(*v1.Event)
+			if ok := r.validateEvent(event, startTime); !ok {
+				return
+			}
+			ch <- getEventFromPod(event, r.getPod(event, startTime), OperatorDelete)
 		},
 	})
+
+	stop := make(chan struct{})
+	defer close(stop)
+	eventsInformer.Run(stop)
+
+	<-stop
 }
 
 func (r *Resolver) PodEvents() <-chan PodEvent {
