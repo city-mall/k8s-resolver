@@ -15,10 +15,32 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
-type Resolver struct {
-	mu  sync.Mutex
-	url string
+const (
+	OperatorAdd    = "Add"
+	OperatorDelete = "Delete"
+	OperatorUpdate = "Update"
+)
 
+type PodEvent struct {
+	Operator string
+	Reason   string
+	Phase    string
+	Name     string
+	Message  string
+	IP       string
+}
+
+func (p *PodEvent) String() string {
+	return "Operator:" + p.Operator + " Reason: " + p.Reason + " Phase: " + p.Phase + " Name: " + p.Name + " Message: " + p.Message
+}
+
+type Resolver struct {
+	mu        sync.Mutex
+	url       string
+	service   string
+	namespace string
+
+	clientset   *kubernetes.Clientset
 	informer    cache.SharedIndexInformer
 	index       int
 	resolvable  bool
@@ -71,6 +93,9 @@ func NewResolverWithOptions(op CreateResolverOptions) *Resolver {
 	service := serviceNameServiceNs[0]
 	namespace := serviceNameServiceNs[1]
 
+	r.service = service
+	r.namespace = namespace
+
 	defer op.Waiter.Done()
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -81,6 +106,8 @@ func NewResolverWithOptions(op CreateResolverOptions) *Resolver {
 	if err != nil {
 		panic(err.Error())
 	}
+
+	r.clientset = clientset
 
 	informer := cache.NewSharedIndexInformer(
 		&cache.ListWatch{
@@ -123,6 +150,58 @@ func NewResolverWithOptions(op CreateResolverOptions) *Resolver {
 	r.informer = informer
 
 	return &r
+}
+
+func getEventFromPod(pod *v1.Pod, operator string) PodEvent {
+	var event PodEvent
+	event.Name = pod.Name
+	event.Phase = string(pod.Status.Phase)
+	event.Reason = string(pod.Status.Reason)
+	event.Message = pod.Status.Message
+	event.Operator = operator
+	event.IP = pod.Status.PodIP
+	return event
+}
+
+func (r *Resolver) listenPodEvents(ch chan<- PodEvent) {
+	informer := cache.NewSharedIndexInformer(
+		&cache.ListWatch{
+			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+				options.FieldSelector = "metadata.name=" + r.service
+				return r.clientset.CoreV1().Endpoints(r.namespace).List(context.Background(), options)
+			},
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+				options.FieldSelector = "metadata.name=" + r.service
+				return r.clientset.CoreV1().Endpoints(r.namespace).Watch(context.Background(), options)
+			},
+		},
+		&v1.Pod{},
+		0,
+		cache.Indexers{},
+	)
+
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			ch <- getEventFromPod(obj.(*v1.Pod), OperatorAdd)
+		},
+		DeleteFunc: func(obj interface{}) {
+			ch <- getEventFromPod(obj.(*v1.Pod), OperatorDelete)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			oldPod := oldObj.(*v1.Pod)
+			newPod := newObj.(*v1.Pod)
+			if oldPod.ResourceVersion == newPod.ResourceVersion {
+				return
+			}
+			ch <- getEventFromPod(newObj.(*v1.Pod), OperatorUpdate)
+		},
+	})
+}
+
+func (r *Resolver) PodEvents() <-chan PodEvent {
+	ch := make(chan PodEvent)
+	go r.listenPodEvents(ch)
+	return ch
 }
 
 func (r *Resolver) Start() {
