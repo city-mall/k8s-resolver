@@ -70,6 +70,17 @@ export class K8sResolover implements Resolver {
     this.namespace = target.authority || "default";
     const hostPort = splitHostPort(target.path);
     this.serviceName = hostPort?.host;
+    if (
+      this.serviceName?.includes("localhost") ||
+      this.serviceName?.includes("127.0.0.1")
+    ) {
+      this.error = {
+        code: Status.UNAVAILABLE,
+        details: `Failed to parse ${target.scheme} address ${target.path} ${target.authority}`,
+        metadata: new Metadata(),
+      };
+      return;
+    }
     this.port = hostPort?.port;
 
     if (!this.serviceName || !this.port) {
