@@ -27,7 +27,6 @@ export const K8sScheme = "k8s";
 const fieldSelectorPrefix = "metadata.name=";
 
 const kc = new k8s.KubeConfig();
-kc.loadFromDefault();
 let k8sApi: k8s.CoreV1Api;
 
 // Initial backoff policy, used to reset the backoffs.
@@ -42,6 +41,7 @@ let backoffFactory: IBackoff<IRetryBackoffContext<unknown>> =
 export const setup = (backoff = new ExponentialBackoff()) => {
   // init k8s client in setup avoid throw error
   // when only import lib in non k8s env
+  kc.loadFromDefault();
   k8sApi = kc.makeApiClient(k8s.CoreV1Api);
   registerResolver(K8sScheme, K8sResolover);
   backoffFactory = backoff;
