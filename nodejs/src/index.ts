@@ -82,9 +82,18 @@ export class K8sResolver implements Resolver {
       metadata: new Metadata(),
     };
 
-    k8sApi.listNamespacedEndpoints(this.namespace, undefined, undefined, undefined, `${FieldSelectorPrefix}${this.serviceName}`).then((res) => {
-      if (res.response.statusCode && res.response.statusCode >= 200 && res.response.statusCode < 300) {
-        this.watch().catch((err) => console.log(`[K8sResolver] watch error`, err));
+    new Promise<void>(async (r) => {
+      try {
+        const res = await k8sApi.listNamespacedEndpoints(this.namespace, undefined, undefined, undefined, `${FieldSelectorPrefix}${this.serviceName}`);
+        if (res.response.statusCode && res.response.statusCode >= 200 && res.response.statusCode < 300) {
+          this.watch().catch((err) => console.log(`[K8sResolver] watch error`, err));
+        }
+      } catch (err) {
+        console.error(
+          "[K8sResolver] The Resolver was not able to make communication with Kubernetes. The Resolver has partially failed and hence it choosed to stay with the default DNS Resolver Implementation."
+        );
+      } finally {
+        r();
       }
     });
   }
