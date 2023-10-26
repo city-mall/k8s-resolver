@@ -2,13 +2,12 @@ import { ChannelOptions, Metadata, StatusObject } from "@grpc/grpc-js";
 import { LogVerbosity, Status } from "@grpc/grpc-js/build/src/constants";
 import * as logging from "@grpc/grpc-js/build/src/logging";
 import * as http from "http";
-import { Resolver, ResolverListener, registerResolver } from "@grpc/grpc-js/build/src/resolver";
+import { Resolver, ResolverListener, registerResolver, createResolver } from "@grpc/grpc-js/build/src/resolver";
 import {} from "@grpc/grpc-js/build/src/resolver-dns";
 import { SubchannelAddress } from "@grpc/grpc-js/build/src/subchannel-address";
 import { GrpcUri, parseUri, splitHostPort, uriToString } from "@grpc/grpc-js/build/src/uri-parser";
 import * as k8s from "@kubernetes/client-node";
 import { ExponentialBackoff, IBackoff, IRetryBackoffContext } from "cockatiel";
-import { DnsResolver } from "./dns";
 
 export const K8sScheme = "k8s";
 const TRACER_NAME = "k8s_resolver";
@@ -46,7 +45,7 @@ export class K8sResolover implements Resolver {
 
   // backoff is use for reconnecting
   private backoff: IBackoff<IRetryBackoffContext<unknown>> | undefined;
-  private dnsResolver: DnsResolver | undefined;
+  private dnsResolver: Resolver | undefined;
   private useDnsResolver = true;
 
   constructor(private target: GrpcUri, private listener: ResolverListener, _channelOptions: ChannelOptions) {
@@ -74,7 +73,7 @@ export class K8sResolover implements Resolver {
       return;
     }
 
-    this.dnsResolver = new DnsResolver(parseUri(`dns:${this.serviceName}.${this.namespace}.svc.cluster.local:${this.port}`)!, listener, _channelOptions);
+    this.dnsResolver = createResolver(parseUri(`dns:${this.serviceName}.${this.namespace}.svc.cluster.local:${this.port}`)!, listener, _channelOptions);
 
     this.defaultResolutionError = {
       code: Status.UNAVAILABLE,
