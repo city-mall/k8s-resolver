@@ -210,6 +210,7 @@ export class K8sResolver implements Resolver {
       await new Promise((r) => setTimeout(r, 1000));
     }
     this.useDnsResolver = false;
+    console.log("[K8sResolver] The Resolver has now been upgraded from Default DNS Resolver to use Kubernetes Endpoints Reader Resolver");
   }
 
   private updateResolutionFromAddress() {
