@@ -30,11 +30,11 @@ export const setup = (backoff = new ExponentialBackoff()) => {
   // when only import lib in non k8s env
   kc.loadFromDefault();
   k8sApi = kc.makeApiClient(k8s.CoreV1Api);
-  registerResolver(K8sScheme, K8sResolver);
+  registerResolver(K8sScheme, K8sResolover);
   backoffFactory = backoff;
 };
 
-export class K8sResolver implements Resolver {
+export class K8sResolover implements Resolver {
   private error: StatusObject | null = null;
   private defaultResolutionError: StatusObject | undefined;
 
