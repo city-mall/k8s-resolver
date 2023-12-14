@@ -9,7 +9,7 @@ import { GrpcUri, parseUri, splitHostPort, uriToString } from "@grpc/grpc-js/bui
 import * as k8s from "@kubernetes/client-node";
 import { ExponentialBackoff, IBackoff, IRetryBackoffContext } from "cockatiel";
 
-export const K8sScheme = "k8s";
+const K8sScheme = "k8s";
 const TRACER_NAME = "k8s_resolver";
 const FieldSelectorPrefix = "metadata.name=";
 
@@ -20,17 +20,20 @@ let k8sApi: k8s.CoreV1Api;
 let backoffFactory: IBackoff<IRetryBackoffContext<unknown>> = new ExponentialBackoff();
 
 /**
- * setup register the k8s:// scheme into grpc resolver
+ * setup register the k8s:// scheme into grpc resolver and returns new address
  * @param backoff - use cockatiel's backoff handle reconnect when error,
  * default is ExponentialBackoff(a max 30 second delay on a decorrelated jitter)
  */
-export const setup = (backoff = new ExponentialBackoff()) => {
+export const setup = (address: string) => {
   // init k8s client in setup avoid throw error
   // when only import lib in non k8s env
   kc.loadFromDefault();
   k8sApi = kc.makeApiClient(k8s.CoreV1Api);
   registerResolver(K8sScheme, K8sResolover);
-  backoffFactory = backoff;
+  const [host, servicePort] = address.split(":");
+  const [serviceName, serviceNs] = host.split(".");
+  address = `${K8sScheme}://${serviceNs}/${serviceName}:${servicePort}`;
+  return address;
 };
 
 export class K8sResolover implements Resolver {
