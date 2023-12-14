@@ -21,7 +21,7 @@ let backoffFactory: IBackoff<IRetryBackoffContext<unknown>> = new ExponentialBac
 
 /**
  * setup register the k8s:// scheme into grpc resolver and returns new address
- * @param backoff - use cockatiel's backoff handle reconnect when error,
+ * @param address - kube cluster url
  * default is ExponentialBackoff(a max 30 second delay on a decorrelated jitter)
  */
 export const setup = (address: string) => {
