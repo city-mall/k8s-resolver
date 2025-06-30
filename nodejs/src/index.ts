@@ -1,11 +1,13 @@
 import { ChannelOptions, Metadata, StatusObject } from "@grpc/grpc-js";
 import { LogVerbosity, Status } from "@grpc/grpc-js/build/src/constants";
 import * as logging from "@grpc/grpc-js/build/src/logging";
+import * as http from "http";
 import { Resolver, ResolverListener, registerResolver, createResolver } from "@grpc/grpc-js/build/src/resolver";
 import {} from "@grpc/grpc-js/build/src/resolver-dns";
 import { Endpoint } from "@grpc/grpc-js/build/src/subchannel-address";
 import { GrpcUri, parseUri, splitHostPort, uriToString } from "@grpc/grpc-js/build/src/uri-parser";
 import * as k8s from "@kubernetes/client-node";
+import { ExponentialBackoff, IBackoff, IRetryBackoffContext } from "cockatiel";
 
 const K8sScheme = "k8s";
 const TRACER_NAME = "k8s_resolver";
@@ -14,7 +16,8 @@ const FieldSelectorPrefix = "metadata.name=";
 const kc = new k8s.KubeConfig();
 let k8sApi: k8s.CoreV1Api;
 
-// In Cockatiel v3.2.1, the API has changed significantly, so we implement our own simple backoff
+// Initial backoff policy, used to reset the backoffs.
+let backoffFactory: IBackoff<IRetryBackoffContext<unknown>> = new ExponentialBackoff();
 
 /**
  * setup register the k8s:// scheme into grpc resolver and returns new address
@@ -44,7 +47,7 @@ export class K8sResolover implements Resolver {
   private informer: k8s.Informer<k8s.V1Endpoints> | undefined;
 
   // backoff is use for reconnecting
-  private backoffTime = 1000; // Start with 1 second
+  private backoff: IBackoff<IRetryBackoffContext<unknown>> | undefined;
   private dnsResolver: Resolver | undefined;
   private useDnsResolver = true;
 
@@ -83,15 +86,13 @@ export class K8sResolover implements Resolver {
 
     new Promise<void>(async (r) => {
       try {
-        await k8sApi.listNamespacedEndpoints({
-          namespace: this.namespace,
-          fieldSelector: `${FieldSelectorPrefix}${this.serviceName}`,
-        });
-        this.watch().catch((err) => console.log(`[K8sResolver] watch error`, err));
+        const res = await k8sApi.listNamespacedEndpoints(this.namespace, undefined, undefined, undefined, `${FieldSelectorPrefix}${this.serviceName}`);
+        if (res.response.statusCode && res.response.statusCode >= 200 && res.response.statusCode < 300) {
+          this.watch().catch((err) => console.log(`[K8sResolver] watch error`, err));
+        }
       } catch (err) {
         console.error(
-          "[K8sResolver] The Resolver was not able to make communication with Kubernetes. The Resolver has partially failed and hence it choosed to stay with the default DNS Resolver Implementation.",
-          err
+          "[K8sResolver] The Resolver was not able to make communication with Kubernetes. The Resolver has partially failed and hence it choosed to stay with the default DNS Resolver Implementation."
         );
       } finally {
         r();
@@ -123,15 +124,11 @@ export class K8sResolover implements Resolver {
 
   private async watch() {
     // watch endpoints by namespace and service name
-    // Create a wrapper function that adapts the return type to match what makeInformer expects in v1.3.0
-
-    const informer = k8s.makeInformer(kc, `/api/v1/namespaces/${this.namespace}/endpoints?fieldSelector=${FieldSelectorPrefix}${this.serviceName}`, async () => {
-      const result = await this.fetchEndpoints();
-      return {
-        metadata: result.metadata,
-        items: result.items,
-      };
-    });
+    const informer = k8s.makeInformer(
+      kc,
+      `/api/v1/namespaces/${this.namespace}/endpoints?fieldSelector=${FieldSelectorPrefix}${this.serviceName}`, // makeInformer not support fieldSelector as params for now
+      () => this.fetchEndpoints()
+    );
 
     informer.on("add", (obj) => {
       this.resetBackoff();
@@ -195,15 +192,16 @@ export class K8sResolover implements Resolver {
         this.listener.onError(this.defaultResolutionError);
       }
 
-      // Implement simple exponential backoff with jitter
-      this.backoffTime = Math.min(30000, this.backoffTime * 1.5); // Cap at 30 seconds
-      const jitter = Math.random() * 0.3 + 0.85; // 0.85-1.15 jitter factor
-      const duration = Math.floor(this.backoffTime * jitter);
+      if (!this.backoff) {
+        this.backoff = backoffFactory.next(null as any);
+      } else {
+        this.backoff = this.backoff.next(null as any) ?? this.backoff;
+      }
 
-      this.trace(`informer error event, will restart informer, backoff duration: ${duration}, err: ${JSON.stringify(err)}`);
+      this.trace(`informer error event, will restart informer, backoff duration: ${this.backoff?.duration() || 0}, err: ${JSON.stringify(err)}`);
 
-      console.log(`[K8sResolver] informer error event, will restart informer, backoff duration: ${duration}, err: ${JSON.stringify(err)}`);
-      setTimeout(() => informer.start().catch((err) => console.error(`[K8sResolver] Error`, err)), duration);
+      console.log(`[K8sResolver] informer error event, will restart informer, backoff duration: ${this.backoff?.duration() || 0}, err: ${JSON.stringify(err)}`);
+      setTimeout(() => informer.start().catch((err) => console.error(`[K8sResolver] Error`, err)), this.backoff?.duration() || 0);
     });
 
     this.informer = informer;
@@ -225,10 +223,10 @@ export class K8sResolover implements Resolver {
     this.trace(`Resolver update listener, address: ${[...this.addresses]}`);
     console.log(`[K8sResolver] Resolver update listener, address: ${[...this.addresses]}`);
 
-    this.listener.onSuccessfulResolution(this.addressToEndpoints(), null, null, null, {});
+    this.listener.onSuccessfulResolution(this.addressToSubchannelAddress(), null, null, null, {});
   }
 
-  private addressToEndpoints(): Endpoint[] {
+  private addressToSubchannelAddress(): Endpoint[] {
     return [
       {
         addresses: [...this.addresses.keys()].map((addr) => ({
@@ -239,12 +237,12 @@ export class K8sResolover implements Resolver {
     ];
   }
 
-  private async fetchEndpoints(): Promise<k8s.V1EndpointsList> {
+  private async fetchEndpoints(): Promise<{
+    response: http.IncomingMessage;
+    body: k8s.V1EndpointsList;
+  }> {
     try {
-      const r = await k8sApi.listNamespacedEndpoints({
-        namespace: this.namespace,
-        fieldSelector: `${FieldSelectorPrefix}${this.serviceName}`,
-      });
+      const r = await k8sApi.listNamespacedEndpoints(this.namespace, undefined, undefined, undefined, `${FieldSelectorPrefix}${this.serviceName}`);
       return r;
     } catch (err) {
       console.error(`[K8sResolver] fetchEndpoints error`, err);
@@ -290,7 +288,7 @@ export class K8sResolover implements Resolver {
   }
 
   private resetBackoff() {
-    this.backoffTime = 1000; // Reset to initial value
+    this.backoff = undefined;
   }
 
   static getDefaultAuthority(target: GrpcUri): string {
