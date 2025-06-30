@@ -9,9 +9,9 @@
   "author": "Arkadev Banerjee",
   "license": "ISC",
   "dependencies": {
-    "@grpc/grpc-js": "^1.8.17",
-    "@kubernetes/client-node": "^0.18.1",
-    "cockatiel": "^1.1.1"
+    "@grpc/grpc-js": "^1.13.4",
+    "@kubernetes/client-node": "^1.3.0",
+    "cockatiel": "^3.2.1"
   },
   "devDependencies": {
     "typescript": "^5.1.6"
