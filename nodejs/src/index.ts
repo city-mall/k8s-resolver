@@ -9,6 +9,30 @@ import { GrpcUri, parseUri, splitHostPort, uriToString } from "@grpc/grpc-js/bui
 import * as k8s from "@kubernetes/client-node";
 import { ExponentialBackoff, IBackoff, IRetryBackoffContext } from "cockatiel";
 
+// @grpc/grpc-js v1.14+ changed ResolverListener from an object with
+// onSuccessfulResolution/onError methods to a plain function.
+// Detect at runtime to support both versions.
+const isLegacyListener = (listener: any): listener is { onSuccessfulResolution: Function; onError: Function } =>
+  typeof listener === "object" && typeof listener.onSuccessfulResolution === "function";
+
+function notifySuccess(listener: any, endpoints: Endpoint[]) {
+  if (isLegacyListener(listener)) {
+    // v1.13.x: listener.onSuccessfulResolution(endpoints, serviceConfig, serviceConfigError, configSelector, attributes)
+    listener.onSuccessfulResolution(endpoints, null, null, null, {});
+  } else if (typeof listener === "function") {
+    // v1.14+: listener(StatusOr<Endpoint[]>, attributes, serviceConfig, resolutionNote)
+    listener({ ok: true, value: endpoints }, {}, null, "");
+  }
+}
+
+function notifyError(listener: any, error: StatusObject) {
+  if (isLegacyListener(listener)) {
+    listener.onError(error);
+  } else if (typeof listener === "function") {
+    listener({ ok: false, error }, {}, null, "");
+  }
+}
+
 const K8sScheme = "k8s";
 const TRACER_NAME = "k8s_resolver";
 const FieldSelectorPrefix = "metadata.name=";
@@ -106,7 +130,7 @@ export class K8sResolover implements Resolver {
       return this.dnsResolver?.updateResolution();
     }
     if (this.error) {
-      setImmediate(() => this.listener.onError(this.error!));
+      setImmediate(() => notifyError(this.listener, this.error!));
     }
   }
 
@@ -189,7 +213,7 @@ export class K8sResolover implements Resolver {
     // so we restart the informer ourselves
     informer.on("error", (err: any) => {
       if (this.defaultResolutionError) {
-        this.listener.onError(this.defaultResolutionError);
+        notifyError(this.listener, this.defaultResolutionError);
       }
 
       if (!this.backoff) {
@@ -223,7 +247,7 @@ export class K8sResolover implements Resolver {
     this.trace(`Resolver update listener, address: ${[...this.addresses]}`);
     console.log(`[K8sResolver] Resolver update listener, address: ${[...this.addresses]}`);
 
-    this.listener.onSuccessfulResolution(this.addressToSubchannelAddress(), null, null, null, {});
+    notifySuccess(this.listener, this.addressToSubchannelAddress());
   }
 
   private addressToSubchannelAddress(): Endpoint[] {
