@@ -56,6 +56,9 @@ func (b *k8sResolverBuilder) Build(target r.Target, cc r.ClientConn, opts r.Buil
 	namespace := target.URL.Hostname()
 	service := target.Endpoint()
 	idx := strings.Index(service, ":")
+	if idx < 0 {
+		return nil, fmt.Errorf("k8s resolver: target endpoint %q is not in service:port form", service)
+	}
 	serviceName := service[:idx]
 	port := service[idx+1:]
 	notifier := make(chan struct{})
@@ -64,7 +67,18 @@ func (b *k8sResolverBuilder) Build(target r.Target, cc r.ClientConn, opts r.Buil
 		return nil, err
 	}
 	go func() {
-		for range notifier {
+		for {
+			// Exit on close. notifier is never closed (the informer's handlers
+			// still hold the send side), so ranging over it would leak this
+			// goroutine for the life of the process, once per ClientConn.
+			select {
+			case <-resolver.ctx.Done():
+				return
+			case _, ok := <-notifier:
+				if !ok {
+					return
+				}
+			}
 			ips := resolver.getIPs()
 			addresses := make([]r.Address, 0, len(ips))
 			for ip := range ips {
@@ -94,10 +108,16 @@ func (b *k8sResolverBuilder) Scheme() string {
 func Try(address string) string {
 	if strings.Contains(address, "svc.cluster.local") {
 		hostServicePort := strings.Split(address, ":")
+		if len(hostServicePort) < 2 {
+			return address
+		}
 		host := hostServicePort[0]
 		servicePort := hostServicePort[1]
 
 		serviceNameServiceNs := strings.Split(host, ".")
+		if len(serviceNameServiceNs) < 2 {
+			return address
+		}
 		serviceName := serviceNameServiceNs[0]
 		serviceNs := serviceNameServiceNs[1]
 
