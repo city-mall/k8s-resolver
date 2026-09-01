@@ -24,16 +24,60 @@ func (f *fakeInformer) Run(stop <-chan struct{}) {
 	close(f.stopped)
 }
 
+// Goes through the same initLifecycle the real constructor uses. Building ctx,
+// cancel and stop by hand here would make every lifecycle test below pass even
+// if the constructor stopped creating them.
 func newTestResolver() (*internalResolver, *fakeInformer) {
 	var r internalResolver
 	r.addresses = make(map[string]bool)
-	cctx, cancel := context.WithCancel(context.Background())
-	r.ctx = cctx
-	r.cancel = cancel
-	r.stop = make(chan struct{})
+	r.initLifecycle(context.Background())
 	fi := &fakeInformer{running: make(chan struct{}), stopped: make(chan struct{})}
 	r.informer = fi
 	return &r, fi
+}
+
+// The stop channel and the cancellable context must exist before start() runs.
+// If the channel creation moves back into start(), informer.Run(nil) blocks on a
+// nil channel and no close() can ever stop it.
+func TestInitLifecycleCreatesStopChannelAndContext(t *testing.T) {
+	var r internalResolver
+	ctx := r.initLifecycle(context.Background())
+
+	if r.stop == nil {
+		t.Fatal("initLifecycle did not create the stop channel: informer.Run(nil) would never return")
+	}
+	if r.cancel == nil || r.ctx == nil || ctx == nil {
+		t.Fatal("initLifecycle did not derive a cancellable context: close() could not release start()")
+	}
+	r.cancel()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("the returned context is not cancelled by r.cancel(): List/Watch calls would outlive close()")
+	}
+}
+
+// gRPC calls Close() from its idle timer while the start goroutine may still be
+// coming up. start() owns the only close(r.stop), behind stopOnce, so no
+// interleaving may double-close it -- that panics and takes the process down.
+func TestConcurrentCloseAndStartNeverDoubleClose(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		r, _ := newTestResolver()
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go r.start(&wg)
+		go r.close()
+		r.close()
+
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("start() never returned under a concurrent close()")
+		}
+	}
 }
 
 // The regression this package exists to prevent: Close() waits on the

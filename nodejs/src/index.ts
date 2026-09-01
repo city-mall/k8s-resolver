@@ -33,6 +33,37 @@ function notifyError(listener: any, error: StatusObject) {
   }
 }
 
+// ListWatch._stop() (client-node dist/cache.js:90-98) is the first statement of
+// doneHandler(), which reopens the watch on its last line. Making _stop() total
+// is what keeps that reopen reachable; see the call site in watch() for why a
+// throw there is uncatchable and permanent.
+//
+// Best-effort by design: if a future client-node drops the private method this
+// quietly does nothing, which is the same behaviour as not calling it at all.
+function guardInformerStop(informer: unknown): void {
+  const lw = informer as { _stop?: () => void; request?: { abort?: () => void } };
+  if (typeof lw._stop !== "function") {
+    return;
+  }
+  const stop = lw._stop.bind(lw);
+  lw._stop = () => {
+    try {
+      stop();
+    } catch (err) {
+      // _stop() throws before it reaches request.abort(), so the watch's socket
+      // is still open. `abort` is one of the keys request@2 refuses to overwrite,
+      // so it is still the real method even on the corrupted object.
+      try {
+        lw.request?.abort?.();
+      } catch {
+        // nothing further we can do; the reference is dropped either way
+      }
+      lw.request = undefined;
+      console.error(`[K8sResolver] informer _stop failed, watch reopened anyway`, err);
+    }
+  };
+}
+
 const K8sScheme = "k8s";
 const TRACER_NAME = "k8s_resolver";
 const FieldSelectorPrefix = "metadata.name=";
@@ -175,6 +206,18 @@ export class K8sResolover implements Resolver {
       `/api/v1/namespaces/${this.namespace}/endpoints?fieldSelector=${FieldSelectorPrefix}${this.serviceName}`, // makeInformer not support fieldSelector as params for now
       () => this.fetchEndpoints()
     );
+
+    // Seen in prod: `TypeError: this.request.removeAllListeners is not a
+    // function` thrown from cache.js:92. request@2 copies every non-reserved
+    // option key onto the Request instance, and `removeAllListeners` is not on
+    // its reserved list, so an option of that name shadows the inherited
+    // EventEmitter method. doneHandler() calls _stop() first and reopens the
+    // watch last, and it runs as a discarded promise (watch.js:72 `done(err)`),
+    // so the throw is uncatchable from here and aborts doneHandler before the
+    // reopen. The informer then stops watching permanently, and because err was
+    // null no "error" event fires, so nothing ever restarts it: the resolver
+    // keeps serving whatever endpoints it last saw, forever.
+    guardInformerStop(informer);
 
     informer.on("add", (obj) => {
       this.resetBackoff();
@@ -347,9 +390,15 @@ export class K8sResolover implements Resolver {
       // the informer's listFn, awaited inside ListWatch.doneHandler, which the
       // watch layer invokes as a discarded promise. A rejection there has no
       // catch anywhere in the process and surfaces as an unhandledRejection,
-      // which Node exits on. Resolve with an empty list instead. The informer
-      // is already stopped and updateResolutionFromAddress() ignores a
-      // destroyed resolver, so nothing acts on the result.
+      // which Node exits on. Resolve with an empty list instead.
+      //
+      // This is not inert: an in-flight doneHandler continues past the list step
+      // and can open one more watch at cache.js:132 that the already-completed
+      // _stop() will not abort. That is bounded to a single watch per destroyed
+      // resolver, and its events are dropped because updateResolutionFromAddress()
+      // ignores a destroyed resolver, so it is strictly better than exiting the
+      // process. `metadata` must be present: doneHandler reads
+      // `list.metadata.resourceVersion` without a guard.
       if (this.destroyed) {
         return {
           response: undefined as unknown as http.IncomingMessage,

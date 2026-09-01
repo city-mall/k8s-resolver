@@ -37,8 +37,24 @@ function makeFakeInformer(listFn) {
   inf.starts = 0;
   inf.stops = 0;
   inf.listFn = listFn;
+  // A real ListWatch.start() runs a list + watch round trip, so it is in flight
+  // for a long time. Resolving synchronously here would make overlapping starts
+  // impossible to express, which would leave the serialization in queueStart()
+  // untested no matter what the assertions said. startBarrier holds a start open
+  // so a second one has a window to overlap it.
+  inf.startBarrier = null;
+  inf.inFlight = 0;
+  inf.maxInFlight = 0;
   inf.start = async () => {
     inf.starts++;
+    inf.inFlight++;
+    if (inf.inFlight > inf.maxInFlight) {
+      inf.maxInFlight = inf.inFlight;
+    }
+    if (inf.startBarrier) {
+      await inf.startBarrier;
+    }
+    inf.inFlight--;
   };
   inf.stop = async () => {
     inf.stops++;
@@ -52,6 +68,40 @@ function makeFakeInformer(listFn) {
       await inf.listFn();
     })();
   };
+
+  // Stand-in for ListWatch._stop (cache.js:90-98). `removeAllListeners` is a
+  // string here, which is exactly the corrupted shape seen in prod: request@2
+  // copies non-reserved option keys onto the instance and shadows the inherited
+  // EventEmitter method. `abort` is reserved, so it survives as a real method.
+  inf.aborted = 0;
+  inf.request = {
+    removeAllListeners: "shadowed by a request option",
+    abort: () => {
+      inf.aborted++;
+    },
+  };
+  inf._stop = () => {
+    if (inf.request) {
+      if (typeof inf.request.removeAllListeners !== "function") {
+        throw new TypeError("this.request.removeAllListeners is not a function");
+      }
+      inf.request.abort();
+      inf.request = undefined;
+    }
+  };
+
+  // Mirror ListWatch.doneHandler(err): cache.js:101 calls this._stop() as its
+  // FIRST statement and only reopens the watch on its LAST (cache.js:132), so a
+  // throw out of _stop() skips the reopen entirely.
+  inf.reopened = 0;
+  inf.driveDoneHandlerWithStop = () => {
+    void (async () => {
+      inf._stop();
+      await inf.listFn();
+      inf.reopened++;
+    })();
+  };
+
   informers.push(inf);
   return inf;
 }
@@ -288,6 +338,109 @@ async function testOverlappingErrorsRestartInformerOnce() {
   await sleep(50);
 }
 
+// ---------------------------------------------------------------------------
+// Prod, recurring: `TypeError: this.request.removeAllListeners is not a
+// function` out of cache.js:92. _stop() is the first statement of doneHandler
+// and the watch is reopened on its last, so the throw strands the informer:
+// it never watches again, and because doneHandler was called with err === null
+// no "error" event fires, so nothing restarts it either. The resolver then
+// serves its last-known endpoint list forever, silently, with no error anywhere
+// except this one uncatchable rejection.
+// ---------------------------------------------------------------------------
+async function testCorruptedRequestDoesNotStrandTheInformer() {
+  informers.length = 0;
+  const { resolver } = newResolver();
+  await sleep(100);
+
+  const inf = informers[0];
+  const rejections = [];
+  const onRejection = (err) => rejections.push(err);
+  process.on("unhandledRejection", onRejection);
+  try {
+    inf.driveDoneHandlerWithStop();
+    await sleep(300);
+  } finally {
+    process.off("unhandledRejection", onRejection);
+  }
+
+  assert.strictEqual(
+    rejections.length,
+    0,
+    `_stop() rejected into doneHandler, which nothing catches (${rejections[0] && rejections[0].message})`
+  );
+  assert.strictEqual(inf.reopened, 1, "doneHandler never reached the reopen: the informer is stranded, watching nothing, forever");
+  assert.strictEqual(inf.aborted, 1, "the corrupted request was never aborted: its watch socket leaks");
+  assert.strictEqual(inf.request, undefined, "the corrupted request is still referenced, so every later _stop() throws again");
+
+  resolver.destroy();
+  await sleep(50);
+}
+
+// ---------------------------------------------------------------------------
+// queueStart() chains starts so they can never run concurrently. Two concurrent
+// ListWatch.start() chains open two apiserver watches but share one `request`
+// field, so the loser is unreachable by _stop() and leaks for the life of the
+// process while still feeding events into a resolver that believes it has one
+// watch. testOverlappingErrorsRestartInformerOnce only covers the clearTimeout;
+// this covers the serialization itself.
+// ---------------------------------------------------------------------------
+async function testStartsNeverOverlap() {
+  informers.length = 0;
+  const { resolver } = newResolver();
+  await sleep(100);
+
+  const inf = informers[0];
+  let release;
+  inf.startBarrier = new Promise((r) => {
+    release = r;
+  });
+
+  // Both paths that produce a start in prod: the initial one from watch() and a
+  // restart from the error handler, arriving while the first is still in flight.
+  resolver.queueStart(inf);
+  resolver.queueStart(inf);
+  await sleep(150);
+
+  assert.strictEqual(
+    inf.maxInFlight,
+    1,
+    `${inf.maxInFlight} starts ran concurrently; every extra chain leaks an apiserver watch that _stop() can never reach`
+  );
+
+  release();
+  await sleep(50);
+  resolver.destroy();
+  await sleep(50);
+}
+
+// ---------------------------------------------------------------------------
+// A stopped informer still drains its cache, firing a delete for every endpoint
+// it held. grpc-js has already torn the channel down by then, so notifying its
+// listener is a use-after-destroy.
+// ---------------------------------------------------------------------------
+async function testEventsAfterDestroyDoNotNotifyListener() {
+  informers.length = 0;
+  const { resolver, seen } = newResolver();
+  await sleep(100);
+
+  const inf = informers[0];
+  inf.emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.1" }] }] });
+  await sleep(1500);
+  assert.ok(seen.ok.length >= 1, "precondition: the listener should have been notified while alive");
+  const before = seen.ok.length;
+
+  resolver.destroy();
+  inf.emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.2" }] }] });
+  inf.emit("delete", { subsets: [{ addresses: [{ ip: "10.0.0.1" }] }] });
+  await sleep(200);
+
+  assert.strictEqual(
+    seen.ok.length,
+    before,
+    `listener was notified ${seen.ok.length - before} time(s) after destroy(): the channel is already gone`
+  );
+}
+
 const tests = [
   testDestroyStopsInformerBeforeUpgrade,
   testDestroyReleasesPollLoop,
@@ -297,6 +450,9 @@ const tests = [
   testUpgradesOffDnsWhenEndpointsArrive,
   testDestroyedListFnDoesNotRejectIntoDoneHandler,
   testOverlappingErrorsRestartInformerOnce,
+  testCorruptedRequestDoesNotStrandTheInformer,
+  testStartsNeverOverlap,
+  testEventsAfterDestroyDoNotNotifyListener,
 ];
 
 (async () => {

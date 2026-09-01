@@ -28,15 +28,7 @@ type internalResolver struct {
 func newInternalResolver(ctx context.Context, service string, namespace string, notify chan struct{}) (*internalResolver, error) {
 	var r internalResolver
 	r.addresses = make(map[string]bool)
-	// Derive our own cancellable context. close() cancels it, which is what
-	// lets start() return and release the WaitGroup that Close() waits on.
-	// Callers pass context.Background(), so without this start() parks forever.
-	cctx, cancel := context.WithCancel(ctx)
-	r.ctx = cctx
-	r.cancel = cancel
-	// Created here rather than in start() so close() can never race a nil
-	// channel when Close() lands before the start goroutine is scheduled.
-	r.stop = make(chan struct{})
+	cctx := r.initLifecycle(ctx)
 
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -113,6 +105,26 @@ func newInternalResolver(ctx context.Context, service string, namespace string, 
 	r.informer = informer
 
 	return &r, nil
+}
+
+// initLifecycle sets up the fields start() and close() rely on, and returns the
+// derived context the informer's List/Watch calls must use.
+//
+// It is a separate method so tests go through the real initialization instead of
+// hand-building these fields: a test that builds its own stop channel would stay
+// green if the channel creation moved back into start(), which is exactly the
+// bug this ordering exists to prevent.
+func (r *internalResolver) initLifecycle(ctx context.Context) context.Context {
+	// Derive our own cancellable context. close() cancels it, which is what
+	// lets start() return and release the WaitGroup that Close() waits on.
+	// Callers pass context.Background(), so without this start() parks forever.
+	cctx, cancel := context.WithCancel(ctx)
+	r.ctx = cctx
+	r.cancel = cancel
+	// Created here rather than in start() so close() can never race a nil
+	// channel when Close() lands before the start goroutine is scheduled.
+	r.stop = make(chan struct{})
+	return cctx
 }
 
 func (r *internalResolver) start(wg *sync.WaitGroup) {
