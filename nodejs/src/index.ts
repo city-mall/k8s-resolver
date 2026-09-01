@@ -74,6 +74,8 @@ export class K8sResolover implements Resolver {
   private backoff: IBackoff<IRetryBackoffContext<unknown>> | undefined;
   private dnsResolver: Resolver | undefined;
   private useDnsResolver = true;
+  private destroyed = false;
+  private restartTimer: NodeJS.Timeout | undefined;
 
   constructor(private target: GrpcUri, private listener: ResolverListener, _channelOptions: ChannelOptions) {
     this.trace("Resolver constructed");
@@ -87,6 +89,11 @@ export class K8sResolover implements Resolver {
         details: `Failed to parse ${target.scheme} address ${target.path} ${target.authority}`,
         metadata: new Metadata(),
       };
+      // These branches return before dnsResolver is created, so leaving
+      // useDnsResolver true makes updateResolution() a no-op: the channel gets
+      // neither a resolution nor an error and every RPC on it sits until its
+      // deadline. Fall through to the error path instead.
+      this.useDnsResolver = false;
       return;
     }
     this.port = hostPort?.port;
@@ -97,6 +104,7 @@ export class K8sResolover implements Resolver {
         details: `Failed to parse ${target.scheme} address ${target.path} ${target.authority}`,
         metadata: new Metadata(),
       };
+      this.useDnsResolver = false;
       return;
     }
 
@@ -135,14 +143,27 @@ export class K8sResolover implements Resolver {
   }
 
   destroy() {
-    if (this.useDnsResolver) {
-      return this.dnsResolver?.destroy();
+    if (this.destroyed) {
+      return;
     }
+    this.destroyed = true;
     this.trace("Resolver destroy");
-    console.log("[K8sResolver] Resolver destroy");
+
+    // Tear down both halves unconditionally. The resolver starts on the DNS
+    // fallback and only clears useDnsResolver once the informer has produced
+    // endpoints, so returning early here left the informer, its watch
+    // connection to the apiserver and the poll loop in watch() running for the
+    // life of the process on every channel closed before it upgraded.
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = undefined;
+    }
+
+    this.dnsResolver?.destroy();
 
     if (this.informer) {
       this.informer.stop().catch((err) => console.error(`[K8sResolver] informer stop error`, err));
+      this.informer = undefined;
     }
   }
 
@@ -171,8 +192,10 @@ export class K8sResolover implements Resolver {
         this.updateResolutionFromAddress();
       }
 
-      this.trace(`informer add event, changed: ${changed}, obj: ${JSON.stringify(obj)}`);
-      console.log(`[K8sResolver] informer add event, changed: ${changed}, obj: ${JSON.stringify(obj)}`);
+      // Never serialise the whole Endpoints object here. This fires on every
+      // endpoint event for every channel, and JSON.stringify runs even when
+      // tracing is off, so a service with churn logs kilobytes per event.
+      this.trace(`informer add event, changed: ${changed}, addresses: ${this.addresses.size}`);
     });
 
     informer.on("delete", (obj) => {
@@ -192,8 +215,7 @@ export class K8sResolover implements Resolver {
         this.updateResolutionFromAddress();
       }
 
-      this.trace(`informer delete event, changed: ${changed}, obj: ${JSON.stringify(obj)}`);
-      console.log(`[K8sResolver] informer delete event, changed: ${changed}, obj: ${JSON.stringify(obj)}`);
+      this.trace(`informer delete event, changed: ${changed}, addresses: ${this.addresses.size}`);
     });
 
     informer.on("update", (obj) => {
@@ -205,13 +227,19 @@ export class K8sResolover implements Resolver {
 
       this.handleFullUpdate(obj.subsets || []);
 
-      this.trace(`informer update event, obj: ${JSON.stringify(obj)}`);
-      console.log(`[K8sResolver] informer update event, obj: ${JSON.stringify(obj)}`);
+      this.trace(`informer update event, addresses: ${this.addresses.size}`);
     });
 
     // informer will not restart when the under watcher got error
     // so we restart the informer ourselves
     informer.on("error", (err: any) => {
+      // A stopped informer still emits its final error. Restarting on it
+      // resurrected an informer the channel had already destroyed, which
+      // reopened a watch against the apiserver that nothing would ever close.
+      if (this.destroyed) {
+        return;
+      }
+
       if (this.defaultResolutionError) {
         notifyError(this.listener, this.defaultResolutionError);
       }
@@ -222,18 +250,37 @@ export class K8sResolover implements Resolver {
         this.backoff = this.backoff.next(null as any) ?? this.backoff;
       }
 
-      this.trace(`informer error event, will restart informer, backoff duration: ${this.backoff?.duration() || 0}, err: ${JSON.stringify(err)}`);
+      this.trace(`informer error event, will restart informer, backoff duration: ${this.backoff?.duration() || 0}`);
 
-      console.log(`[K8sResolver] informer error event, will restart informer, backoff duration: ${this.backoff?.duration() || 0}, err: ${JSON.stringify(err)}`);
-      setTimeout(() => informer.start().catch((err) => console.error(`[K8sResolver] Error`, err)), this.backoff?.duration() || 0);
+      // JSON.stringify of an Error yields "{}"; log the object itself.
+      console.error(`[K8sResolver] informer error event, will restart informer, backoff duration: ${this.backoff?.duration() || 0}, err:`, err);
+      this.restartTimer = setTimeout(() => {
+        this.restartTimer = undefined;
+        if (this.destroyed) {
+          return;
+        }
+        informer.start().catch((err) => console.error(`[K8sResolver] Error`, err));
+      }, this.backoff?.duration() || 0);
     });
+
+    // destroy() can land while the initial endpoints list above is in flight,
+    // before this.informer is set, which would leave this informer running with
+    // nothing holding a reference to stop it.
+    if (this.destroyed) {
+      return;
+    }
 
     this.informer = informer;
 
     this.informer.start().catch((err) => console.error(`[K8sResolver] Error`, err));
 
-    while (this.addresses.size === 0) {
+    // Bounded by destroy(): without it this loop kept a 1s timer alive forever
+    // on every channel that was closed before its first endpoint arrived.
+    while (this.addresses.size === 0 && !this.destroyed) {
       await new Promise((r) => setTimeout(r, 1000));
+    }
+    if (this.destroyed) {
+      return;
     }
     this.useDnsResolver = false;
     console.log("[K8sResolver] The Resolver has now been upgraded from Default DNS Resolver to use Kubernetes Endpoints Reader Resolver");
@@ -270,6 +317,13 @@ export class K8sResolover implements Resolver {
       return r;
     } catch (err) {
       console.error(`[K8sResolver] fetchEndpoints error`, err);
+      // Retrying forever kept the promise chain, and so the destroyed resolver,
+      // alive for the life of the process whenever the apiserver stayed
+      // unreachable. Hand the failure to the informer instead; its error
+      // handler owns the backoff and is itself gated on destroyed.
+      if (this.destroyed) {
+        throw err;
+      }
       await new Promise((resolve) => setTimeout(resolve, 1000));
       return this.fetchEndpoints();
     }
@@ -304,7 +358,6 @@ export class K8sResolover implements Resolver {
     }
 
     this.trace(`HandleFullUpdate changed: ${changed}`);
-    console.log(`[K8sResolver] HandleFullUpdate changed: ${changed}`);
   }
 
   private trace(msg: string) {
