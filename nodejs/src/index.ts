@@ -59,7 +59,9 @@ function guardInformerStop(informer: unknown): void {
         // nothing further we can do; the reference is dropped either way
       }
       lw.request = undefined;
-      console.error(`[K8sResolver] informer _stop failed, watch reopened anyway`, err);
+      // Deliberately does not claim the watch reopened: on the doneHandler path
+      // it does, but stop() also calls _stop() and nothing reopens after that.
+      console.error(`[K8sResolver] informer _stop failed, aborted the watch socket directly`, err);
     }
   };
 }
