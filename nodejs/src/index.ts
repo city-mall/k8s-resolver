@@ -75,6 +75,7 @@ export class K8sResolover implements Resolver {
   private dnsResolver: Resolver | undefined;
   private useDnsResolver = true;
   private destroyed = false;
+  private restart: Promise<void> = Promise.resolve();
   private restartTimer: NodeJS.Timeout | undefined;
 
   constructor(private target: GrpcUri, private listener: ResolverListener, _channelOptions: ChannelOptions) {
@@ -254,12 +255,15 @@ export class K8sResolover implements Resolver {
 
       // JSON.stringify of an Error yields "{}"; log the object itself.
       console.error(`[K8sResolver] informer error event, will restart informer, backoff duration: ${this.backoff?.duration() || 0}, err:`, err);
+      // Two errors inside one backoff window each scheduled their own restart:
+      // the second setTimeout overwrote this.restartTimer without clearing the
+      // first, so both fired. destroy() then only knew about the last one.
+      if (this.restartTimer) {
+        clearTimeout(this.restartTimer);
+      }
       this.restartTimer = setTimeout(() => {
         this.restartTimer = undefined;
-        if (this.destroyed) {
-          return;
-        }
-        informer.start().catch((err) => console.error(`[K8sResolver] Error`, err));
+        this.queueStart(informer);
       }, this.backoff?.duration() || 0);
     });
 
@@ -272,7 +276,7 @@ export class K8sResolover implements Resolver {
 
     this.informer = informer;
 
-    this.informer.start().catch((err) => console.error(`[K8sResolver] Error`, err));
+    this.queueStart(informer);
 
     // Bounded by destroy(): without it this loop kept a 1s timer alive forever
     // on every channel that was closed before its first endpoint arrived.
@@ -286,7 +290,27 @@ export class K8sResolover implements Resolver {
     console.log("[K8sResolver] The Resolver has now been upgraded from Default DNS Resolver to use Kubernetes Endpoints Reader Resolver");
   }
 
+  // Starts must never overlap. ListWatch.start() runs a doneHandler chain that
+  // ends by assigning the single `request` field, so two concurrent chains open
+  // two apiserver watches and only the last one is reachable by _stop(): the
+  // loser leaks for the life of the process and keeps delivering events into a
+  // resolver that believes it has one watch. Chaining rather than dropping the
+  // request keeps a restart that arrives while a start is still in flight.
+  private queueStart(informer: k8s.Informer<k8s.V1Endpoints>) {
+    this.restart = this.restart
+      .catch(() => undefined)
+      .then(() => (this.destroyed ? undefined : informer.start()));
+    this.restart.catch((err) => console.error(`[K8sResolver] Error`, err));
+  }
+
   private updateResolutionFromAddress() {
+    // A stopped informer still drains its cache: the final list resolves empty,
+    // ListWatch fires a delete for every endpoint it held, and those handlers
+    // land here. grpc-js has already torn the channel down by then, so
+    // notifying its listener is a use-after-destroy.
+    if (this.destroyed) {
+      return;
+    }
     if (this.addresses.size === 0) {
       return;
     }
@@ -319,10 +343,18 @@ export class K8sResolover implements Resolver {
       console.error(`[K8sResolver] fetchEndpoints error`, err);
       // Retrying forever kept the promise chain, and so the destroyed resolver,
       // alive for the life of the process whenever the apiserver stayed
-      // unreachable. Hand the failure to the informer instead; its error
-      // handler owns the backoff and is itself gated on destroyed.
+      // unreachable. Stop retrying once destroyed, but never reject: this is
+      // the informer's listFn, awaited inside ListWatch.doneHandler, which the
+      // watch layer invokes as a discarded promise. A rejection there has no
+      // catch anywhere in the process and surfaces as an unhandledRejection,
+      // which Node exits on. Resolve with an empty list instead. The informer
+      // is already stopped and updateResolutionFromAddress() ignores a
+      // destroyed resolver, so nothing acts on the result.
       if (this.destroyed) {
-        throw err;
+        return {
+          response: undefined as unknown as http.IncomingMessage,
+          body: { items: [], metadata: {} } as k8s.V1EndpointsList,
+        };
       }
       await new Promise((resolve) => setTimeout(resolve, 1000));
       return this.fetchEndpoints();

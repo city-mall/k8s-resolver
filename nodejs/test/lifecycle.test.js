@@ -32,15 +32,25 @@ global.setTimeout = function (fn, delay, ...rest) {
 // ---------------------------------------------------------------------------
 const informers = [];
 
-function makeFakeInformer() {
+function makeFakeInformer(listFn) {
   const inf = new EventEmitter();
   inf.starts = 0;
   inf.stops = 0;
+  inf.listFn = listFn;
   inf.start = async () => {
     inf.starts++;
   };
   inf.stop = async () => {
     inf.stops++;
+  };
+  // Mirror the one call shape that matters for the listFn: ListWatch.doneHandler
+  // awaits listFn() inside an async method (cache.js:113-115), and the watch
+  // layer invokes that method as a discarded promise (watch.js:70 `done(err)`,
+  // and stream close). A rejection there has no catch anywhere in the process.
+  inf.driveDoneHandler = () => {
+    void (async () => {
+      await inf.listFn();
+    })();
   };
   informers.push(inf);
   return inf;
@@ -62,7 +72,7 @@ const fakeK8s = {
     }
   },
   CoreV1Api: class {},
-  makeInformer: () => makeFakeInformer(),
+  makeInformer: (_kc, _path, listFn) => makeFakeInformer(listFn),
 };
 
 const realResolve = Module._resolveFilename;
@@ -214,6 +224,70 @@ async function testUpgradesOffDnsWhenEndpointsArrive() {
   assert.strictEqual(informers[0].stops, 1, "destroy() after upgrade must still stop the informer");
 }
 
+// ---------------------------------------------------------------------------
+// fetchEndpoints is the informer's listFn. A destroyed resolver used to rethrow
+// from its catch to break the retry loop, but doneHandler awaits the listFn and
+// nothing catches doneHandler, so the rejection became an unhandledRejection --
+// which Node exits on. An apiserver blip during a normal channel teardown was
+// enough to kill the whole process.
+// ---------------------------------------------------------------------------
+async function testDestroyedListFnDoesNotRejectIntoDoneHandler() {
+  informers.length = 0;
+  const { resolver } = newResolver();
+  await sleep(100);
+
+  const inf = informers[0];
+  const rejections = [];
+  const onRejection = (err) => rejections.push(err);
+  process.on("unhandledRejection", onRejection);
+  try {
+    resolver.destroy();
+    listBehaviour = () => {
+      throw new Error("apiserver unreachable");
+    };
+    inf.driveDoneHandler();
+    await sleep(300);
+  } finally {
+    process.off("unhandledRejection", onRejection);
+    listBehaviour = () => ({ response: { statusCode: 200 }, body: { items: [] } });
+  }
+
+  assert.strictEqual(
+    rejections.length,
+    0,
+    `listFn rejected into ListWatch.doneHandler, which nothing catches: the process exits (${rejections[0] && rejections[0].message})`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Two errors inside one backoff window each scheduled a restart: the second
+// setTimeout overwrote restartTimer without clearing the first, so both fired.
+// Two concurrent ListWatch.start() chains open two apiserver watches but share
+// one `request` field, so the loser is unreachable by _stop() and leaks for the
+// life of the process while still feeding events to the resolver.
+// ---------------------------------------------------------------------------
+async function testOverlappingErrorsRestartInformerOnce() {
+  informers.length = 0;
+  const { resolver } = newResolver();
+  await sleep(100);
+
+  const inf = informers[0];
+  assert.strictEqual(inf.starts, 1, "watch() should have started the informer exactly once");
+
+  inf.emit("error", new Error("watch closed"));
+  inf.emit("error", new Error("watch closed again"));
+  await sleep(1500);
+
+  assert.strictEqual(
+    inf.starts,
+    2,
+    `two errors ran ${inf.starts - 1} restarts; every concurrent chain leaks an unabortable apiserver watch`
+  );
+
+  resolver.destroy();
+  await sleep(50);
+}
+
 const tests = [
   testDestroyStopsInformerBeforeUpgrade,
   testDestroyReleasesPollLoop,
@@ -221,6 +295,8 @@ const tests = [
   testDoubleDestroyIsSafe,
   testUnparseableTargetReportsError,
   testUpgradesOffDnsWhenEndpointsArrive,
+  testDestroyedListFnDoesNotRejectIntoDoneHandler,
+  testOverlappingErrorsRestartInformerOnce,
 ];
 
 (async () => {
