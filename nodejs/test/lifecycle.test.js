@@ -18,6 +18,7 @@ const Module = require("module");
 // ---------------------------------------------------------------------------
 let pollTicks = 0;
 let relistTicks = 0;
+let relistDeadlineTicks = 0;
 const realSetTimeout = global.setTimeout;
 global.setTimeout = function (fn, delay, ...rest) {
   if (delay === 1000) {
@@ -26,6 +27,15 @@ global.setTimeout = function (fn, delay, ...rest) {
   if (delay >= 30000 && delay <= 60000) {
     relistTicks++;
     return realSetTimeout(fn, 20, ...rest);
+  }
+  // The re-list deadline. Matching the exact shipped value is the assertion:
+  // change RELIST_DEADLINE_MS in src and this rung stops firing, so the hang
+  // test waits the real 15s and fails instead of passing quietly. The 10ms it
+  // compresses to keeps the shipped invariant intact in the test too, deadline
+  // strictly below one interval, so a wedged tick never costs the next one.
+  if (delay === 15000) {
+    relistDeadlineTicks++;
+    return realSetTimeout(fn, 10, ...rest);
   }
   return realSetTimeout(fn, delay, ...rest);
 };
@@ -112,6 +122,7 @@ function makeFakeInformer(listFn) {
 }
 
 let listCalls = 0;
+let listArgs = [];
 // The apiserver serves the list and the watch from one state, so a fake that
 // answers the informer with endpoints and the list with nothing is a state no
 // cluster can be in. Since the periodic re-list applies the list as the full
@@ -124,13 +135,22 @@ const defaultListBehaviour = () => ({
 });
 let listBehaviour = defaultListBehaviour;
 
+// Interceptors installed on the clients built below. The real generated client
+// applies these to the underlying request options, which is the only hook it
+// offers onto the transport; there is no per-call timeout argument.
+const interceptors = [];
+
 const fakeK8s = {
   KubeConfig: class {
     loadFromDefault() {}
     makeApiClient() {
       return {
-        listNamespacedEndpoints: async () => {
+        addInterceptor: (fn) => {
+          interceptors.push(fn);
+        },
+        listNamespacedEndpoints: async (...args) => {
           listCalls++;
+          listArgs = args;
           return listBehaviour();
         },
       };
@@ -562,6 +582,107 @@ async function testEventsAfterDestroyDoNotNotifyListener() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// The liveness floor must not contain the failure it exists to catch. A
+// blackholed TCP connection to the apiserver never errors, so an endpoint list
+// with no client-side deadline never settles: relistInFlight stays true, every
+// later tick returns at its own guard, and the floor is dead for the life of
+// the process with no log line to say so. That is the same silent freeze the
+// floor was added to bound, one layer up.
+// ---------------------------------------------------------------------------
+async function testPeriodicRelistSurvivesHangingList() {
+  informers.length = 0;
+  apiEndpointIps = ["10.0.0.1"];
+
+  const { resolver, seen } = newResolver();
+  let releaseHang = () => {};
+  try {
+    await sleep(100);
+    informers[0].emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.1" }] }] });
+    await sleep(1500);
+    assert.strictEqual(resolver.useDnsResolver, false, "precondition: the resolver should use the initial endpoint");
+
+    // The apiserver accepts the connection and then answers nothing, ever.
+    const hang = new Promise((r) => {
+      releaseHang = r;
+    });
+    listBehaviour = () => hang;
+
+    const callsAtHang = listCalls;
+    await sleep(300);
+    assert.ok(
+      listCalls > callsAtHang + 1,
+      `one hung endpoint list wedged the liveness floor: ${listCalls - callsAtHang} list(s) issued across ~15 intervals`
+    );
+
+    // The apiserver comes back. The floor has to notice with no informer event.
+    apiEndpointIps = ["10.0.0.2"];
+    listBehaviour = defaultListBehaviour;
+    await sleep(200);
+
+    const latest = seen.ok[seen.ok.length - 1][0];
+    assert.deepStrictEqual(
+      latest[0].addresses.map((address) => `${address.host}:${address.port}`),
+      ["10.0.0.2:1234"],
+      "the resolver never recovered after one endpoint list hung"
+    );
+
+    // The abandoned request finally answers, minutes late, with the endpoint
+    // set the cluster had before it blackholed. Promise.race discarded that
+    // value when the deadline won, so it must never reach the listener: an
+    // abandoned list resurrecting a stale snapshot would be a worse bug than
+    // the one being fixed.
+    releaseHang({ response: { statusCode: 200 }, body: { items: [{ subsets: [{ addresses: [{ ip: "10.9.9.9" }] }] }] } });
+    await sleep(60);
+    const served = seen.ok.map((call) => call[0][0].addresses.map((address) => address.host).join(","));
+    assert.ok(!served.includes("10.9.9.9"), `an abandoned endpoint list was applied after its deadline: ${served.join(" | ")}`);
+  } finally {
+    releaseHang({ response: { statusCode: 200 }, body: { items: [] } });
+    listBehaviour = defaultListBehaviour;
+    resolver.destroy();
+    apiEndpointIps = [];
+    await sleep(50);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The floor runs on every k8s:// channel in the fleet, so its list has to be
+// the cheap read class and it has to be bounded at the transport as well as by
+// the deadline. An unset resourceVersion makes every one of those lists a
+// quorum etcd read; a missing request timeout leaks one socket per tick for the
+// length of an apiserver outage.
+// ---------------------------------------------------------------------------
+async function testPeriodicRelistIsCachedAndBounded() {
+  informers.length = 0;
+  apiEndpointIps = ["10.0.0.1"];
+
+  const { resolver } = newResolver();
+  try {
+    await sleep(100);
+    informers[0].emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.1" }] }] });
+    await sleep(1500);
+
+    listArgs = [];
+    const deadlinesBefore = relistDeadlineTicks;
+    await sleep(120);
+
+    assert.strictEqual(listArgs[7], "0", "the periodic re-list dropped resourceVersion=0 and is billing the apiserver a quorum etcd read on every channel");
+    assert.ok(relistDeadlineTicks > deadlinesBefore, "the periodic re-list ran with no client-side deadline");
+
+    assert.ok(interceptors.length > 0, "nothing installs a transport timeout on the re-list client");
+    const requestOptions = {};
+    for (const interceptor of interceptors) {
+      interceptor(requestOptions);
+    }
+    assert.strictEqual(typeof requestOptions.timeout, "number", "the re-list client's interceptor does not set a request timeout");
+    assert.ok(requestOptions.timeout < 30000, `the re-list transport timeout (${requestOptions.timeout}ms) must be shorter than one re-list interval`);
+  } finally {
+    resolver.destroy();
+    apiEndpointIps = [];
+    await sleep(50);
+  }
+}
+
 const tests = [
   testDestroyStopsInformerBeforeUpgrade,
   testDestroyReleasesPollLoop,
@@ -573,6 +694,8 @@ const tests = [
   testOverlappingErrorsRestartInformerOnce,
   testCorruptedRequestDoesNotStrandTheInformer,
   testPeriodicRelistRecoversDeadInformer,
+  testPeriodicRelistSurvivesHangingList,
+  testPeriodicRelistIsCachedAndBounded,
   testDestroyReleasesDnsFallbackAfterUpgrade,
   testStartsNeverOverlap,
   testEventsAfterDestroyDoNotNotifyListener,

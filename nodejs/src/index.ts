@@ -72,9 +72,31 @@ const FieldSelectorPrefix = "metadata.name=";
 const RELIST_BASE_INTERVAL_MS = 30_000;
 const RELIST_JITTER_INTERVAL_MS = 30_000;
 const INFORMER_STALE_AFTER_MS = 2 * 60_000;
+// Both of these MUST stay below RELIST_BASE_INTERVAL_MS. A blackholed TCP
+// connection to the apiserver never errors and node's HTTP client has no
+// default socket timeout, so an unbounded list would leave relistInFlight set
+// and kill the liveness floor exactly the way a silent watch death kills the
+// informer. Keeping the deadline under one interval is what makes the floor's
+// bound one interval rather than one interval plus however long a wedged
+// request takes to notice: the next tick always finds the flag clear.
+// The transport timeout is the shorter of the two on purpose, so the usual
+// report comes from the layer that can actually abort the socket; the deadline
+// is the backstop for a hang that happens before the request is even issued,
+// such as a credential refresh inside the client's interceptor chain.
+const RELIST_REQUEST_TIMEOUT_MS = 10_000;
+const RELIST_DEADLINE_MS = 15_000;
+// A re-list failure is per-channel and the fleet runs thousands of them, so an
+// apiserver outage would otherwise turn into thousands of identical log lines a
+// second aimed at the thing that is already down.
+const RELIST_ERROR_LOG_INTERVAL_MS = 5 * 60_000;
 
 const kc = new k8s.KubeConfig();
 let k8sApi: k8s.CoreV1Api;
+// A second client purely for the periodic re-list. The transport timeout below
+// is installed per client and the informer's own list has different retry
+// semantics, so keeping them apart stops a change to the floor reaching into
+// the watch path.
+let relistApi: k8s.CoreV1Api;
 
 // Initial backoff policy, used to reset the backoffs.
 let backoffFactory: IBackoff<IRetryBackoffContext<unknown>> = new ExponentialBackoff();
@@ -89,6 +111,16 @@ export const setup = (address: string) => {
   // when only import lib in non k8s env
   kc.loadFromDefault();
   k8sApi = kc.makeApiClient(k8s.CoreV1Api);
+  relistApi = kc.makeApiClient(k8s.CoreV1Api);
+  // The generated client takes no per-call timeout: its trailing `options`
+  // argument carries headers and nothing else. An interceptor is its only hook
+  // onto the underlying request options, and request@2 honours `timeout` by
+  // aborting the socket. Without it the deadline below would still unwedge the
+  // floor, but every wedged list would leak its socket for the length of an
+  // apiserver outage, one per channel per interval.
+  relistApi.addInterceptor((requestOptions) => {
+    requestOptions.timeout = RELIST_REQUEST_TIMEOUT_MS;
+  });
   registerResolver(K8sScheme, K8sResolover);
   const [host, servicePort] = address.split(":");
   const [serviceName, serviceNs] = host.split(".");
@@ -117,6 +149,7 @@ export class K8sResolover implements Resolver {
   private relistInFlight = false;
   private lastInformerEventAt = Date.now();
   private lastStalenessAlarmAt = 0;
+  private lastRelistErrorLogAt = 0;
 
   constructor(private target: GrpcUri, private listener: ResolverListener, _channelOptions: ChannelOptions) {
     this.trace("Resolver constructed");
@@ -375,7 +408,7 @@ export class K8sResolover implements Resolver {
 
     this.relistInFlight = true;
     try {
-      const { body } = await this.fetchEndpoints();
+      const { body } = await this.listEndpointsOnce();
       if (this.destroyed || !Array.isArray(body.items)) {
         if (!this.destroyed) {
           console.error(`[K8sResolver] periodic endpoint re-list returned an invalid response`);
@@ -387,12 +420,70 @@ export class K8sResolover implements Resolver {
       for (const item of body.items) {
         subsets.push(...(item.subsets || []));
       }
+      this.lastRelistErrorLogAt = 0;
       this.handleFullUpdate(subsets);
     } catch (err) {
-      console.error(`[K8sResolver] periodic endpoint re-list error`, err);
+      this.reportRelistError(err);
     } finally {
       this.relistInFlight = false;
     }
+  }
+
+  // Single-shot, deliberately unlike fetchEndpoints(). Two reasons.
+  //
+  // fetchEndpoints() never rejects: it is the informer's listFn and a rejection
+  // there lands on a discarded promise, so it retries every second forever
+  // instead. Awaiting that from the liveness tick means the tick never settles
+  // when the apiserver blackholes, which is the one failure this whole floor
+  // exists to survive. It also put the periodic path into that unbacked-off 1s
+  // loop for the whole of an outage, which fleet-wide is thousands of requests
+  // a second at an apiserver that is already degraded. The liveness timer is
+  // the retry here, at a 30-60s cadence, so a failed tick just waits for the
+  // next one.
+  //
+  // resourceVersion "0" serves the list from the apiserver's watch cache
+  // instead of a quorum etcd read. This call runs on every k8s:// channel in
+  // the fleet and a liveness floor on a 45s average cadence has no use for
+  // read-after-write consistency, so do not drop it to "fix" staleness: a list
+  // a few hundred milliseconds behind is still decades fresher than the dead
+  // snapshot this is here to replace.
+  private listEndpointsOnce(): Promise<{ body: k8s.V1EndpointsList }> {
+    let deadlineTimer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      deadlineTimer = setTimeout(() => reject(new Error(`periodic endpoint re-list exceeded ${RELIST_DEADLINE_MS}ms`)), RELIST_DEADLINE_MS);
+    });
+
+    const list = relistApi.listNamespacedEndpoints(this.namespace, undefined, undefined, undefined, `${FieldSelectorPrefix}${this.serviceName}`, undefined, undefined, "0");
+    // Abandoning a list must not take the process with it. Promise.race already
+    // subscribes to this promise, so a late rejection is technically handled,
+    // but stating it here is cheap and says why it matters: an unhandled
+    // rejection exits node, which is the trap documented in fetchEndpoints().
+    // Swallowing also drops the VALUE, which is the part that makes abandoning
+    // safe: a request that blackholes and finally answers minutes later cannot
+    // reach handleFullUpdate() and resurrect the endpoint set the cluster had
+    // before it went away. The race keeps only the winner.
+    list.catch(() => undefined);
+
+    return Promise.race([list, deadline]).then(
+      (result) => {
+        clearTimeout(deadlineTimer);
+        return result;
+      },
+      (err) => {
+        clearTimeout(deadlineTimer);
+        throw err;
+      }
+    );
+  }
+
+  private reportRelistError(err: unknown) {
+    const now = Date.now();
+    if (this.lastRelistErrorLogAt && now - this.lastRelistErrorLogAt < RELIST_ERROR_LOG_INTERVAL_MS) {
+      return;
+    }
+
+    this.lastRelistErrorLogAt = now;
+    console.error(`[K8sResolver] periodic endpoint re-list error, suppressing repeats for ${RELIST_ERROR_LOG_INTERVAL_MS / 60_000}m`, err);
   }
 
   private checkInformerStaleness() {
