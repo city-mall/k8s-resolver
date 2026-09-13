@@ -17,10 +17,25 @@ const Module = require("module");
 // for the life of the process.
 // ---------------------------------------------------------------------------
 let pollTicks = 0;
+let relistTicks = 0;
+let relistDeadlineTicks = 0;
 const realSetTimeout = global.setTimeout;
 global.setTimeout = function (fn, delay, ...rest) {
   if (delay === 1000) {
     pollTicks++;
+  }
+  if (delay >= 30000 && delay <= 60000) {
+    relistTicks++;
+    return realSetTimeout(fn, 20, ...rest);
+  }
+  // The re-list deadline. Matching the exact shipped value is the assertion:
+  // change RELIST_DEADLINE_MS in src and this rung stops firing, so the hang
+  // test waits the real 15s and fails instead of passing quietly. The 10ms it
+  // compresses to keeps the shipped invariant intact in the test too, deadline
+  // strictly below one interval, so a wedged tick never costs the next one.
+  if (delay === 15000) {
+    relistDeadlineTicks++;
+    return realSetTimeout(fn, 10, ...rest);
   }
   return realSetTimeout(fn, delay, ...rest);
 };
@@ -107,15 +122,35 @@ function makeFakeInformer(listFn) {
 }
 
 let listCalls = 0;
-let listBehaviour = () => ({ response: { statusCode: 200 }, body: { items: [] } });
+let listArgs = [];
+// The apiserver serves the list and the watch from one state, so a fake that
+// answers the informer with endpoints and the list with nothing is a state no
+// cluster can be in. Since the periodic re-list applies the list as the full
+// truth, that inconsistency would silently erase endpoints an informer event
+// had just delivered. A test that emits endpoints publishes them here too.
+let apiEndpointIps = [];
+const defaultListBehaviour = () => ({
+  response: { statusCode: 200 },
+  body: { items: [{ subsets: [{ addresses: apiEndpointIps.map((ip) => ({ ip })) }] }] },
+});
+let listBehaviour = defaultListBehaviour;
+
+// Interceptors installed on the clients built below. The real generated client
+// applies these to the underlying request options, which is the only hook it
+// offers onto the transport; there is no per-call timeout argument.
+const interceptors = [];
 
 const fakeK8s = {
   KubeConfig: class {
     loadFromDefault() {}
     makeApiClient() {
       return {
-        listNamespacedEndpoints: async () => {
+        addInterceptor: (fn) => {
+          interceptors.push(fn);
+        },
+        listNamespacedEndpoints: async (...args) => {
           listCalls++;
+          listArgs = args;
           return listBehaviour();
         },
       };
@@ -139,6 +174,29 @@ const { parseUri } = require("@grpc/grpc-js/build/src/resolver");
 const uriParser = require("@grpc/grpc-js/build/src/uri-parser");
 
 setup("svc.ns.svc.cluster.local:1234");
+
+// ---------------------------------------------------------------------------
+// Count destroy() on the DNS fallback resolver. The published build returned
+// early from destroy() whenever the resolver had already upgraded off DNS, so
+// the fallback resolver, which owns its own backoff timer and socket, outlived
+// every channel that closed after upgrading. grpc-js reads createResolver off
+// the module object at call time, so patching it here is visible to the
+// already-required dist build.
+// ---------------------------------------------------------------------------
+const grpcResolver = require("@grpc/grpc-js/build/src/resolver");
+const dnsResolvers = [];
+const realCreateResolver = grpcResolver.createResolver;
+grpcResolver.createResolver = function (...args) {
+  const created = realCreateResolver.apply(this, args);
+  const record = { destroys: 0 };
+  const realDestroy = created.destroy.bind(created);
+  created.destroy = () => {
+    record.destroys++;
+    return realDestroy();
+  };
+  dnsResolvers.push(record);
+  return created;
+};
 
 const sleep = (ms) => new Promise((r) => realSetTimeout(r, ms));
 
@@ -256,18 +314,23 @@ async function testUnparseableTargetReportsError() {
 async function testUpgradesOffDnsWhenEndpointsArrive() {
   informers.length = 0;
   const { resolver, seen } = newResolver();
-  await sleep(100);
+  try {
+    await sleep(100);
 
-  informers[0].emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.1" }, { ip: "10.0.0.2" }] }] });
-  await sleep(1500);
+    apiEndpointIps = ["10.0.0.1", "10.0.0.2"];
+    informers[0].emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.1" }, { ip: "10.0.0.2" }] }] });
+    await sleep(1500);
 
-  assert.strictEqual(resolver.useDnsResolver, false, "resolver never upgraded off the DNS fallback");
-  assert.ok(seen.ok.length >= 1, "listener was never given endpoints");
-  const endpoints = seen.ok[0][0];
-  assert.deepStrictEqual(
-    endpoints[0].addresses.map((a) => `${a.host}:${a.port}`),
-    ["10.0.0.1:1234", "10.0.0.2:1234"]
-  );
+    assert.strictEqual(resolver.useDnsResolver, false, "resolver never upgraded off the DNS fallback");
+    assert.ok(seen.ok.length >= 1, "listener was never given endpoints");
+    const endpoints = seen.ok[0][0];
+    assert.deepStrictEqual(
+      endpoints[0].addresses.map((a) => `${a.host}:${a.port}`),
+      ["10.0.0.1:1234", "10.0.0.2:1234"]
+    );
+  } finally {
+    apiEndpointIps = [];
+  }
 
   resolver.destroy();
   await sleep(50);
@@ -299,7 +362,7 @@ async function testDestroyedListFnDoesNotRejectIntoDoneHandler() {
     await sleep(300);
   } finally {
     process.off("unhandledRejection", onRejection);
-    listBehaviour = () => ({ response: { statusCode: 200 }, body: { items: [] } });
+    listBehaviour = defaultListBehaviour;
   }
 
   assert.strictEqual(
@@ -384,6 +447,82 @@ async function testCorruptedRequestDoesNotStrandTheInformer() {
 // watch. testOverlappingErrorsRestartInformerOnce only covers the clearTimeout;
 // this covers the serialization itself.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// The informer can stop without emitting an error. A periodic Kubernetes list
+// must still replace a stale endpoint snapshot without any informer event.
+// ---------------------------------------------------------------------------
+async function testPeriodicRelistRecoversDeadInformer() {
+  informers.length = 0;
+  apiEndpointIps = ["10.0.0.1"];
+
+  const { resolver, seen } = newResolver();
+  const relistsBefore = relistTicks;
+  try {
+    await sleep(100);
+    const inf = informers[0];
+    inf.emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.1" }] }] });
+    await sleep(1500);
+    assert.strictEqual(resolver.useDnsResolver, false, "precondition: the resolver should use the initial endpoint");
+
+    // The informer dies without an error and never reports this endpoint change.
+    inf.driveDoneHandlerWithStop();
+    apiEndpointIps = ["10.0.0.2"];
+    await sleep(150);
+
+    assert.ok(relistTicks > relistsBefore, "the resolver did not schedule a periodic endpoint re-list");
+    const latest = seen.ok[seen.ok.length - 1][0];
+    assert.deepStrictEqual(
+      latest[0].addresses.map((address) => `${address.host}:${address.port}`),
+      ["10.0.0.2:1234"],
+      "the resolver kept serving the dead informer's endpoint snapshot"
+    );
+  } finally {
+    resolver.destroy();
+    apiEndpointIps = [];
+    await sleep(50);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// queueStart() chains starts so they can never run concurrently. Two concurrent
+// ListWatch.start() chains open two apiserver watches but share one `request`
+// field, so the loser is unreachable by _stop() and leaks for the life of the
+// process while still feeding events to the resolver. testOverlappingErrorsRestartInformerOnce
+// only covers the clearTimeout; this covers the serialization itself.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// destroy() must tear down the DNS fallback resolver even after the resolver
+// has upgraded off it. The published build returned early on
+// `if (this.useDnsResolver)`, so exactly one of the two halves was ever
+// released: a channel closed before upgrading leaked the informer, and a
+// channel closed after upgrading leaked the DNS resolver. The second half had
+// no coverage, so nothing stopped it coming back.
+// ---------------------------------------------------------------------------
+async function testDestroyReleasesDnsFallbackAfterUpgrade() {
+  informers.length = 0;
+  const dnsBefore = dnsResolvers.length;
+  const { resolver } = newResolver();
+  try {
+    await sleep(100);
+    assert.strictEqual(dnsResolvers.length, dnsBefore + 1, "precondition: the resolver should have built a DNS fallback");
+    const dns = dnsResolvers[dnsBefore];
+
+    apiEndpointIps = ["10.0.0.1"];
+    informers[0].emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.1" }] }] });
+    await sleep(1500);
+    assert.strictEqual(resolver.useDnsResolver, false, "precondition: the resolver should have upgraded off the DNS fallback");
+    assert.strictEqual(dns.destroys, 0, "precondition: the DNS fallback should still be alive before destroy()");
+
+    resolver.destroy();
+    await sleep(50);
+
+    assert.strictEqual(dns.destroys, 1, "destroy() left the DNS fallback resolver running after the resolver upgraded off it");
+  } finally {
+    apiEndpointIps = [];
+    resolver.destroy();
+  }
+}
+
 async function testStartsNeverOverlap() {
   informers.length = 0;
   const { resolver } = newResolver();
@@ -424,12 +563,14 @@ async function testEventsAfterDestroyDoNotNotifyListener() {
   await sleep(100);
 
   const inf = informers[0];
+  apiEndpointIps = ["10.0.0.1"];
   inf.emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.1" }] }] });
   await sleep(1500);
   assert.ok(seen.ok.length >= 1, "precondition: the listener should have been notified while alive");
   const before = seen.ok.length;
 
   resolver.destroy();
+  apiEndpointIps = [];
   inf.emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.2" }] }] });
   inf.emit("delete", { subsets: [{ addresses: [{ ip: "10.0.0.1" }] }] });
   await sleep(200);
@@ -439,6 +580,107 @@ async function testEventsAfterDestroyDoNotNotifyListener() {
     before,
     `listener was notified ${seen.ok.length - before} time(s) after destroy(): the channel is already gone`
   );
+}
+
+// ---------------------------------------------------------------------------
+// The liveness floor must not contain the failure it exists to catch. A
+// blackholed TCP connection to the apiserver never errors, so an endpoint list
+// with no client-side deadline never settles: relistInFlight stays true, every
+// later tick returns at its own guard, and the floor is dead for the life of
+// the process with no log line to say so. That is the same silent freeze the
+// floor was added to bound, one layer up.
+// ---------------------------------------------------------------------------
+async function testPeriodicRelistSurvivesHangingList() {
+  informers.length = 0;
+  apiEndpointIps = ["10.0.0.1"];
+
+  const { resolver, seen } = newResolver();
+  let releaseHang = () => {};
+  try {
+    await sleep(100);
+    informers[0].emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.1" }] }] });
+    await sleep(1500);
+    assert.strictEqual(resolver.useDnsResolver, false, "precondition: the resolver should use the initial endpoint");
+
+    // The apiserver accepts the connection and then answers nothing, ever.
+    const hang = new Promise((r) => {
+      releaseHang = r;
+    });
+    listBehaviour = () => hang;
+
+    const callsAtHang = listCalls;
+    await sleep(300);
+    assert.ok(
+      listCalls > callsAtHang + 1,
+      `one hung endpoint list wedged the liveness floor: ${listCalls - callsAtHang} list(s) issued across ~15 intervals`
+    );
+
+    // The apiserver comes back. The floor has to notice with no informer event.
+    apiEndpointIps = ["10.0.0.2"];
+    listBehaviour = defaultListBehaviour;
+    await sleep(200);
+
+    const latest = seen.ok[seen.ok.length - 1][0];
+    assert.deepStrictEqual(
+      latest[0].addresses.map((address) => `${address.host}:${address.port}`),
+      ["10.0.0.2:1234"],
+      "the resolver never recovered after one endpoint list hung"
+    );
+
+    // The abandoned request finally answers, minutes late, with the endpoint
+    // set the cluster had before it blackholed. Promise.race discarded that
+    // value when the deadline won, so it must never reach the listener: an
+    // abandoned list resurrecting a stale snapshot would be a worse bug than
+    // the one being fixed.
+    releaseHang({ response: { statusCode: 200 }, body: { items: [{ subsets: [{ addresses: [{ ip: "10.9.9.9" }] }] }] } });
+    await sleep(60);
+    const served = seen.ok.map((call) => call[0][0].addresses.map((address) => address.host).join(","));
+    assert.ok(!served.includes("10.9.9.9"), `an abandoned endpoint list was applied after its deadline: ${served.join(" | ")}`);
+  } finally {
+    releaseHang({ response: { statusCode: 200 }, body: { items: [] } });
+    listBehaviour = defaultListBehaviour;
+    resolver.destroy();
+    apiEndpointIps = [];
+    await sleep(50);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The floor runs on every k8s:// channel in the fleet, so its list has to be
+// the cheap read class and it has to be bounded at the transport as well as by
+// the deadline. An unset resourceVersion makes every one of those lists a
+// quorum etcd read; a missing request timeout leaks one socket per tick for the
+// length of an apiserver outage.
+// ---------------------------------------------------------------------------
+async function testPeriodicRelistIsCachedAndBounded() {
+  informers.length = 0;
+  apiEndpointIps = ["10.0.0.1"];
+
+  const { resolver } = newResolver();
+  try {
+    await sleep(100);
+    informers[0].emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.1" }] }] });
+    await sleep(1500);
+
+    listArgs = [];
+    const deadlinesBefore = relistDeadlineTicks;
+    await sleep(120);
+
+    assert.strictEqual(listArgs[7], "0", "the periodic re-list dropped resourceVersion=0 and is billing the apiserver a quorum etcd read on every channel");
+    assert.ok(relistDeadlineTicks > deadlinesBefore, "the periodic re-list ran with no client-side deadline");
+
+    assert.ok(interceptors.length > 0, "nothing installs a transport timeout on the re-list client");
+    const requestOptions = {};
+    for (const interceptor of interceptors) {
+      interceptor(requestOptions);
+    }
+    assert.strictEqual(typeof requestOptions.timeout, "number", "the re-list client's interceptor does not set a request timeout");
+    assert.ok(requestOptions.timeout < 30000, `the re-list transport timeout (${requestOptions.timeout}ms) must be shorter than one re-list interval`);
+  } finally {
+    resolver.destroy();
+    apiEndpointIps = [];
+    await sleep(50);
+  }
 }
 
 const tests = [
@@ -451,6 +693,10 @@ const tests = [
   testDestroyedListFnDoesNotRejectIntoDoneHandler,
   testOverlappingErrorsRestartInformerOnce,
   testCorruptedRequestDoesNotStrandTheInformer,
+  testPeriodicRelistRecoversDeadInformer,
+  testPeriodicRelistSurvivesHangingList,
+  testPeriodicRelistIsCachedAndBounded,
+  testDestroyReleasesDnsFallbackAfterUpgrade,
   testStartsNeverOverlap,
   testEventsAfterDestroyDoNotNotifyListener,
 ];
