@@ -155,6 +155,29 @@ const uriParser = require("@grpc/grpc-js/build/src/uri-parser");
 
 setup("svc.ns.svc.cluster.local:1234");
 
+// ---------------------------------------------------------------------------
+// Count destroy() on the DNS fallback resolver. The published build returned
+// early from destroy() whenever the resolver had already upgraded off DNS, so
+// the fallback resolver, which owns its own backoff timer and socket, outlived
+// every channel that closed after upgrading. grpc-js reads createResolver off
+// the module object at call time, so patching it here is visible to the
+// already-required dist build.
+// ---------------------------------------------------------------------------
+const grpcResolver = require("@grpc/grpc-js/build/src/resolver");
+const dnsResolvers = [];
+const realCreateResolver = grpcResolver.createResolver;
+grpcResolver.createResolver = function (...args) {
+  const created = realCreateResolver.apply(this, args);
+  const record = { destroys: 0 };
+  const realDestroy = created.destroy.bind(created);
+  created.destroy = () => {
+    record.destroys++;
+    return realDestroy();
+  };
+  dnsResolvers.push(record);
+  return created;
+};
+
 const sleep = (ms) => new Promise((r) => realSetTimeout(r, ms));
 
 function newListener() {
@@ -447,6 +470,39 @@ async function testPeriodicRelistRecoversDeadInformer() {
 // process while still feeding events to the resolver. testOverlappingErrorsRestartInformerOnce
 // only covers the clearTimeout; this covers the serialization itself.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// destroy() must tear down the DNS fallback resolver even after the resolver
+// has upgraded off it. The published build returned early on
+// `if (this.useDnsResolver)`, so exactly one of the two halves was ever
+// released: a channel closed before upgrading leaked the informer, and a
+// channel closed after upgrading leaked the DNS resolver. The second half had
+// no coverage, so nothing stopped it coming back.
+// ---------------------------------------------------------------------------
+async function testDestroyReleasesDnsFallbackAfterUpgrade() {
+  informers.length = 0;
+  const dnsBefore = dnsResolvers.length;
+  const { resolver } = newResolver();
+  try {
+    await sleep(100);
+    assert.strictEqual(dnsResolvers.length, dnsBefore + 1, "precondition: the resolver should have built a DNS fallback");
+    const dns = dnsResolvers[dnsBefore];
+
+    apiEndpointIps = ["10.0.0.1"];
+    informers[0].emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.1" }] }] });
+    await sleep(1500);
+    assert.strictEqual(resolver.useDnsResolver, false, "precondition: the resolver should have upgraded off the DNS fallback");
+    assert.strictEqual(dns.destroys, 0, "precondition: the DNS fallback should still be alive before destroy()");
+
+    resolver.destroy();
+    await sleep(50);
+
+    assert.strictEqual(dns.destroys, 1, "destroy() left the DNS fallback resolver running after the resolver upgraded off it");
+  } finally {
+    apiEndpointIps = [];
+    resolver.destroy();
+  }
+}
+
 async function testStartsNeverOverlap() {
   informers.length = 0;
   const { resolver } = newResolver();
@@ -517,6 +573,7 @@ const tests = [
   testOverlappingErrorsRestartInformerOnce,
   testCorruptedRequestDoesNotStrandTheInformer,
   testPeriodicRelistRecoversDeadInformer,
+  testDestroyReleasesDnsFallbackAfterUpgrade,
   testStartsNeverOverlap,
   testEventsAfterDestroyDoNotNotifyListener,
 ];
