@@ -112,7 +112,17 @@ function makeFakeInformer(listFn) {
 }
 
 let listCalls = 0;
-let listBehaviour = () => ({ response: { statusCode: 200 }, body: { items: [] } });
+// The apiserver serves the list and the watch from one state, so a fake that
+// answers the informer with endpoints and the list with nothing is a state no
+// cluster can be in. Since the periodic re-list applies the list as the full
+// truth, that inconsistency would silently erase endpoints an informer event
+// had just delivered. A test that emits endpoints publishes them here too.
+let apiEndpointIps = [];
+const defaultListBehaviour = () => ({
+  response: { statusCode: 200 },
+  body: { items: [{ subsets: [{ addresses: apiEndpointIps.map((ip) => ({ ip })) }] }] },
+});
+let listBehaviour = defaultListBehaviour;
 
 const fakeK8s = {
   KubeConfig: class {
@@ -261,18 +271,23 @@ async function testUnparseableTargetReportsError() {
 async function testUpgradesOffDnsWhenEndpointsArrive() {
   informers.length = 0;
   const { resolver, seen } = newResolver();
-  await sleep(100);
+  try {
+    await sleep(100);
 
-  informers[0].emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.1" }, { ip: "10.0.0.2" }] }] });
-  await sleep(1500);
+    apiEndpointIps = ["10.0.0.1", "10.0.0.2"];
+    informers[0].emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.1" }, { ip: "10.0.0.2" }] }] });
+    await sleep(1500);
 
-  assert.strictEqual(resolver.useDnsResolver, false, "resolver never upgraded off the DNS fallback");
-  assert.ok(seen.ok.length >= 1, "listener was never given endpoints");
-  const endpoints = seen.ok[0][0];
-  assert.deepStrictEqual(
-    endpoints[0].addresses.map((a) => `${a.host}:${a.port}`),
-    ["10.0.0.1:1234", "10.0.0.2:1234"]
-  );
+    assert.strictEqual(resolver.useDnsResolver, false, "resolver never upgraded off the DNS fallback");
+    assert.ok(seen.ok.length >= 1, "listener was never given endpoints");
+    const endpoints = seen.ok[0][0];
+    assert.deepStrictEqual(
+      endpoints[0].addresses.map((a) => `${a.host}:${a.port}`),
+      ["10.0.0.1:1234", "10.0.0.2:1234"]
+    );
+  } finally {
+    apiEndpointIps = [];
+  }
 
   resolver.destroy();
   await sleep(50);
@@ -304,7 +319,7 @@ async function testDestroyedListFnDoesNotRejectIntoDoneHandler() {
     await sleep(300);
   } finally {
     process.off("unhandledRejection", onRejection);
-    listBehaviour = () => ({ response: { statusCode: 200 }, body: { items: [] } });
+    listBehaviour = defaultListBehaviour;
   }
 
   assert.strictEqual(
@@ -395,14 +410,7 @@ async function testCorruptedRequestDoesNotStrandTheInformer() {
 // ---------------------------------------------------------------------------
 async function testPeriodicRelistRecoversDeadInformer() {
   informers.length = 0;
-  let endpointIps = ["10.0.0.1"];
-  const defaultListBehaviour = listBehaviour;
-  listBehaviour = () => ({
-    response: { statusCode: 200 },
-    body: {
-      items: [{ subsets: [{ addresses: endpointIps.map((ip) => ({ ip })) }] }],
-    },
-  });
+  apiEndpointIps = ["10.0.0.1"];
 
   const { resolver, seen } = newResolver();
   const relistsBefore = relistTicks;
@@ -415,7 +423,7 @@ async function testPeriodicRelistRecoversDeadInformer() {
 
     // The informer dies without an error and never reports this endpoint change.
     inf.driveDoneHandlerWithStop();
-    endpointIps = ["10.0.0.2"];
+    apiEndpointIps = ["10.0.0.2"];
     await sleep(150);
 
     assert.ok(relistTicks > relistsBefore, "the resolver did not schedule a periodic endpoint re-list");
@@ -427,7 +435,7 @@ async function testPeriodicRelistRecoversDeadInformer() {
     );
   } finally {
     resolver.destroy();
-    listBehaviour = defaultListBehaviour;
+    apiEndpointIps = [];
     await sleep(50);
   }
 }
@@ -479,12 +487,14 @@ async function testEventsAfterDestroyDoNotNotifyListener() {
   await sleep(100);
 
   const inf = informers[0];
+  apiEndpointIps = ["10.0.0.1"];
   inf.emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.1" }] }] });
   await sleep(1500);
   assert.ok(seen.ok.length >= 1, "precondition: the listener should have been notified while alive");
   const before = seen.ok.length;
 
   resolver.destroy();
+  apiEndpointIps = [];
   inf.emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.2" }] }] });
   inf.emit("delete", { subsets: [{ addresses: [{ ip: "10.0.0.1" }] }] });
   await sleep(200);
