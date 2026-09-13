@@ -69,6 +69,9 @@ function guardInformerStop(informer: unknown): void {
 const K8sScheme = "k8s";
 const TRACER_NAME = "k8s_resolver";
 const FieldSelectorPrefix = "metadata.name=";
+const RELIST_BASE_INTERVAL_MS = 30_000;
+const RELIST_JITTER_INTERVAL_MS = 30_000;
+const INFORMER_STALE_AFTER_MS = 2 * 60_000;
 
 const kc = new k8s.KubeConfig();
 let k8sApi: k8s.CoreV1Api;
@@ -110,6 +113,10 @@ export class K8sResolover implements Resolver {
   private destroyed = false;
   private restart: Promise<void> = Promise.resolve();
   private restartTimer: NodeJS.Timeout | undefined;
+  private livenessTimer: NodeJS.Timeout | undefined;
+  private relistInFlight = false;
+  private lastInformerEventAt = Date.now();
+  private lastStalenessAlarmAt = 0;
 
   constructor(private target: GrpcUri, private listener: ResolverListener, _channelOptions: ChannelOptions) {
     this.trace("Resolver constructed");
@@ -192,6 +199,10 @@ export class K8sResolover implements Resolver {
       clearTimeout(this.restartTimer);
       this.restartTimer = undefined;
     }
+    if (this.livenessTimer) {
+      clearTimeout(this.livenessTimer);
+      this.livenessTimer = undefined;
+    }
 
     this.dnsResolver?.destroy();
 
@@ -222,6 +233,7 @@ export class K8sResolover implements Resolver {
     guardInformerStop(informer);
 
     informer.on("add", (obj) => {
+      this.markInformerEvent();
       this.resetBackoff();
 
       let changed = false;
@@ -245,6 +257,7 @@ export class K8sResolover implements Resolver {
     });
 
     informer.on("delete", (obj) => {
+      this.markInformerEvent();
       this.resetBackoff();
 
       let changed = false;
@@ -265,6 +278,7 @@ export class K8sResolover implements Resolver {
     });
 
     informer.on("update", (obj) => {
+      this.markInformerEvent();
       this.resetBackoff();
 
       if (!obj.subsets || !Array.isArray(obj.subsets)) {
@@ -279,6 +293,7 @@ export class K8sResolover implements Resolver {
     // informer will not restart when the under watcher got error
     // so we restart the informer ourselves
     informer.on("error", (err: any) => {
+      this.markInformerEvent();
       // A stopped informer still emits its final error. Restarting on it
       // resurrected an informer the channel had already destroyed, which
       // reopened a watch against the apiserver that nothing would ever close.
@@ -320,6 +335,7 @@ export class K8sResolover implements Resolver {
     }
 
     this.informer = informer;
+    this.scheduleLivenessCheck();
 
     this.queueStart(informer);
 
@@ -333,6 +349,71 @@ export class K8sResolover implements Resolver {
     }
     this.useDnsResolver = false;
     console.log("[K8sResolver] The Resolver has now been upgraded from Default DNS Resolver to use Kubernetes Endpoints Reader Resolver");
+  }
+
+  // A timer is independent of the informer so a silent watch death cannot keep
+  // the resolver on a dead endpoint snapshot forever. Per-channel jitter spreads
+  // lists across the 30-60s window without adding a process-wide scheduler.
+  private scheduleLivenessCheck() {
+    const delay = RELIST_BASE_INTERVAL_MS + Math.floor(Math.random() * RELIST_JITTER_INTERVAL_MS);
+    this.livenessTimer = setTimeout(() => {
+      this.livenessTimer = undefined;
+      if (this.destroyed) {
+        return;
+      }
+
+      this.checkInformerStaleness();
+      void this.relistEndpoints();
+      this.scheduleLivenessCheck();
+    }, delay);
+  }
+
+  private async relistEndpoints() {
+    if (this.destroyed || this.relistInFlight) {
+      return;
+    }
+
+    this.relistInFlight = true;
+    try {
+      const { body } = await this.fetchEndpoints();
+      if (this.destroyed || !Array.isArray(body.items)) {
+        if (!this.destroyed) {
+          console.error(`[K8sResolver] periodic endpoint re-list returned an invalid response`);
+        }
+        return;
+      }
+
+      const subsets: k8s.V1EndpointSubset[] = [];
+      for (const item of body.items) {
+        subsets.push(...(item.subsets || []));
+      }
+      this.handleFullUpdate(subsets);
+    } catch (err) {
+      console.error(`[K8sResolver] periodic endpoint re-list error`, err);
+    } finally {
+      this.relistInFlight = false;
+    }
+  }
+
+  private checkInformerStaleness() {
+    const now = Date.now();
+    const staleFor = now - this.lastInformerEventAt;
+    if (staleFor < INFORMER_STALE_AFTER_MS) {
+      return;
+    }
+    if (this.lastStalenessAlarmAt && now - this.lastStalenessAlarmAt < INFORMER_STALE_AFTER_MS) {
+      return;
+    }
+
+    this.lastStalenessAlarmAt = now;
+    console.error(
+      `[K8sResolver] informer stale for ${Math.floor(staleFor / 1000)}s, no informer event in ${INFORMER_STALE_AFTER_MS / 60_000}m; periodic re-list remains active`
+    );
+  }
+
+  private markInformerEvent() {
+    this.lastInformerEventAt = Date.now();
+    this.lastStalenessAlarmAt = 0;
   }
 
   // Starts must never overlap. ListWatch.start() runs a doneHandler chain that
@@ -356,10 +437,9 @@ export class K8sResolover implements Resolver {
     if (this.destroyed) {
       return;
     }
-    if (this.addresses.size === 0) {
-      return;
-    }
-
+    // An empty endpoint set is a real scale-to-zero observation. Propagating it
+    // removes departed pod IPs from grpc-js; keeping the old set can blackhole
+    // every RPC until this process is restarted.
     this.trace(`Resolver update listener, address: ${[...this.addresses]}`);
     console.log(`[K8sResolver] Resolver update listener, address: ${[...this.addresses]}`);
 

@@ -17,10 +17,15 @@ const Module = require("module");
 // for the life of the process.
 // ---------------------------------------------------------------------------
 let pollTicks = 0;
+let relistTicks = 0;
 const realSetTimeout = global.setTimeout;
 global.setTimeout = function (fn, delay, ...rest) {
   if (delay === 1000) {
     pollTicks++;
+  }
+  if (delay >= 30000 && delay <= 60000) {
+    relistTicks++;
+    return realSetTimeout(fn, 20, ...rest);
   }
   return realSetTimeout(fn, delay, ...rest);
 };
@@ -384,6 +389,56 @@ async function testCorruptedRequestDoesNotStrandTheInformer() {
 // watch. testOverlappingErrorsRestartInformerOnce only covers the clearTimeout;
 // this covers the serialization itself.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// The informer can stop without emitting an error. A periodic Kubernetes list
+// must still replace a stale endpoint snapshot without any informer event.
+// ---------------------------------------------------------------------------
+async function testPeriodicRelistRecoversDeadInformer() {
+  informers.length = 0;
+  let endpointIps = ["10.0.0.1"];
+  const defaultListBehaviour = listBehaviour;
+  listBehaviour = () => ({
+    response: { statusCode: 200 },
+    body: {
+      items: [{ subsets: [{ addresses: endpointIps.map((ip) => ({ ip })) }] }],
+    },
+  });
+
+  const { resolver, seen } = newResolver();
+  const relistsBefore = relistTicks;
+  try {
+    await sleep(100);
+    const inf = informers[0];
+    inf.emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.1" }] }] });
+    await sleep(1500);
+    assert.strictEqual(resolver.useDnsResolver, false, "precondition: the resolver should use the initial endpoint");
+
+    // The informer dies without an error and never reports this endpoint change.
+    inf.driveDoneHandlerWithStop();
+    endpointIps = ["10.0.0.2"];
+    await sleep(150);
+
+    assert.ok(relistTicks > relistsBefore, "the resolver did not schedule a periodic endpoint re-list");
+    const latest = seen.ok[seen.ok.length - 1][0];
+    assert.deepStrictEqual(
+      latest[0].addresses.map((address) => `${address.host}:${address.port}`),
+      ["10.0.0.2:1234"],
+      "the resolver kept serving the dead informer's endpoint snapshot"
+    );
+  } finally {
+    resolver.destroy();
+    listBehaviour = defaultListBehaviour;
+    await sleep(50);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// queueStart() chains starts so they can never run concurrently. Two concurrent
+// ListWatch.start() chains open two apiserver watches but share one `request`
+// field, so the loser is unreachable by _stop() and leaks for the life of the
+// process while still feeding events to the resolver. testOverlappingErrorsRestartInformerOnce
+// only covers the clearTimeout; this covers the serialization itself.
+// ---------------------------------------------------------------------------
 async function testStartsNeverOverlap() {
   informers.length = 0;
   const { resolver } = newResolver();
@@ -451,6 +506,7 @@ const tests = [
   testDestroyedListFnDoesNotRejectIntoDoneHandler,
   testOverlappingErrorsRestartInformerOnce,
   testCorruptedRequestDoesNotStrandTheInformer,
+  testPeriodicRelistRecoversDeadInformer,
   testStartsNeverOverlap,
   testEventsAfterDestroyDoNotNotifyListener,
 ];
