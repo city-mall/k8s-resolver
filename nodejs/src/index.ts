@@ -406,9 +406,7 @@ export class K8sResolover implements Resolver {
     }
 
     this.lastStalenessAlarmAt = now;
-    console.error(
-      `[K8sResolver] informer stale for ${Math.floor(staleFor / 1000)}s, no informer event in ${INFORMER_STALE_AFTER_MS / 60_000}m; periodic re-list remains active`
-    );
+    console.error(`[K8sResolver] informer stale for ${Math.floor(staleFor / 1000)}s, no informer event in ${INFORMER_STALE_AFTER_MS / 60_000}m; periodic re-list remains active`);
   }
 
   private markInformerEvent() {
