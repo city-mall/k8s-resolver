@@ -66,6 +66,35 @@ function guardInformerStop(informer: unknown): void {
   };
 }
 
+// Seen in prod (Sentry FLOW-6X): `RequestError: Error: Too Many Requests` as an
+// unhandled rejection. When the apiserver throttles a watch, client-node's
+// DefaultRequest.webRequest (watch.js:23) emits `new Error(statusMessage)` on
+// the request. The informer handles that via done(err) and our "error" handler
+// backs off, so nothing is actually broken. But in services that also load
+// request-promise, the request@2 instance behind the watch carries an rp
+// promise that nobody awaits, and request-promise-core rejects it with a
+// RequestError on that same error. That rejection is what reaches Sentry.
+//
+// Attaching a no-op catch to that promise marks it handled. The watch error
+// still flows through done(err) exactly as before. Best-effort like
+// guardInformerStop(): without request-promise there is no promise and this
+// does nothing.
+function guardWatchRequestPromise(informer: unknown): void {
+  const lw = informer as { watch?: { requestImpl?: { webRequest?: (opts: unknown) => unknown } } };
+  const impl = lw.watch?.requestImpl;
+  if (!impl || typeof impl.webRequest !== "function") {
+    return;
+  }
+  const webRequest = impl.webRequest.bind(impl);
+  impl.webRequest = (opts: unknown) => {
+    const req = webRequest(opts) as { _rp_promise?: { catch?: (fn: () => void) => unknown } } | undefined;
+    if (req && req._rp_promise && typeof req._rp_promise.catch === "function") {
+      req._rp_promise.catch(() => undefined);
+    }
+    return req;
+  };
+}
+
 const K8sScheme = "k8s";
 const TRACER_NAME = "k8s_resolver";
 const FieldSelectorPrefix = "metadata.name=";
@@ -264,6 +293,7 @@ export class K8sResolover implements Resolver {
     // null no "error" event fires, so nothing ever restarts it: the resolver
     // keeps serving whatever endpoints it last saw, forever.
     guardInformerStop(informer);
+    guardWatchRequestPromise(informer);
 
     informer.on("add", (obj) => {
       this.markInformerEvent();
