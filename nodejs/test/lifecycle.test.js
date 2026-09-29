@@ -121,6 +121,24 @@ function makeFakeInformer(listFn) {
   return inf;
 }
 
+// Stand-in for client-node's Watch + DefaultRequest, with a request object
+// carrying request-promise's `_rp_promise` the way it does in prod. A 429
+// rejects that promise (request-promise-core plumbing.js:87); nobody awaits it.
+function attachFakeWatch(inf) {
+  inf.watch = {
+    requestImpl: {
+      webRequest() {
+        const req = new EventEmitter();
+        req._rp_promise = new Promise((_, reject) => {
+          req.on("error", (err) => reject(Object.assign(new Error(`${err}`), { name: "RequestError", cause: err })));
+        });
+        inf.lastWatchRequest = req;
+        return req;
+      },
+    },
+  };
+}
+
 let listCalls = 0;
 let listArgs = [];
 // The apiserver serves the list and the watch from one state, so a fake that
@@ -157,7 +175,11 @@ const fakeK8s = {
     }
   },
   CoreV1Api: class {},
-  makeInformer: (_kc, _path, listFn) => makeFakeInformer(listFn),
+  makeInformer: (_kc, _path, listFn) => {
+    const inf = makeFakeInformer(listFn);
+    attachFakeWatch(inf);
+    return inf;
+  },
 };
 
 const realResolve = Module._resolveFilename;
@@ -410,6 +432,29 @@ async function testOverlappingErrorsRestartInformerOnce() {
 // serves its last-known endpoint list forever, silently, with no error anywhere
 // except this one uncatchable rejection.
 // ---------------------------------------------------------------------------
+// FLOW-6X: an apiserver 429 on the watch must not surface as an unhandled
+// RequestError from request-promise's orphan promise.
+async function testWatch429DoesNotRejectUnhandled() {
+  informers.length = 0;
+  const { resolver } = newResolver();
+  await sleep(100);
+
+  const inf = informers[0];
+  const rejections = [];
+  const onRejection = (err) => rejections.push(err);
+  process.on("unhandledRejection", onRejection);
+  try {
+    const req = inf.watch.requestImpl.webRequest({});
+    const err = Object.assign(new Error("Too Many Requests"), { statusCode: 429 });
+    req.emit("error", err);
+    await sleep(50);
+  } finally {
+    process.removeListener("unhandledRejection", onRejection);
+    resolver.destroy();
+  }
+  assert.strictEqual(rejections.length, 0, `watch 429 escaped as unhandled rejection: ${rejections[0] && rejections[0].message}`);
+}
+
 async function testCorruptedRequestDoesNotStrandTheInformer() {
   informers.length = 0;
   const { resolver } = newResolver();
@@ -693,6 +738,7 @@ const tests = [
   testDestroyedListFnDoesNotRejectIntoDoneHandler,
   testOverlappingErrorsRestartInformerOnce,
   testCorruptedRequestDoesNotStrandTheInformer,
+  testWatch429DoesNotRejectUnhandled,
   testPeriodicRelistRecoversDeadInformer,
   testPeriodicRelistSurvivesHangingList,
   testPeriodicRelistIsCachedAndBounded,
