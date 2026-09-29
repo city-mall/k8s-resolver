@@ -157,7 +157,185 @@ export const setup = (address: string) => {
   return address;
 };
 
-export class K8sResolover implements Resolver {
+interface EndpointsWatchSubscriber {
+  onWatchEvent(type: "add" | "update" | "delete", obj: k8s.V1Endpoints): void;
+  onWatchError(err: unknown): void;
+}
+
+// One apiserver watch per namespace/service per process (Sentry FLOW-6X). Every
+// k8s:// channel used to open its own informer, so a process with N channels to
+// one service held N identical watches, and after an apiserver blip all N
+// reopened inside the same backoff window. The apiserver throttles that with
+// 429s, which are exactly the errors that make every one of them back off and
+// retry again. Channels to the same service now share a single informer, its
+// backoff and its restart chain; each channel keeps its own address set,
+// listener and liveness re-list.
+const sharedWatches = new Map<string, SharedEndpointsWatch>();
+
+class SharedEndpointsWatch {
+  private readonly subscribers = new Set<EndpointsWatchSubscriber>();
+  private readonly informer: k8s.Informer<k8s.V1Endpoints>;
+  private backoff: IBackoff<IRetryBackoffContext<unknown>> | undefined;
+  private restart: Promise<void> = Promise.resolve();
+  private restartTimer: NodeJS.Timeout | undefined;
+  private stopped = false;
+
+  static acquire(namespace: string, serviceName: string, subscriber: EndpointsWatchSubscriber): SharedEndpointsWatch {
+    const key = `${namespace}/${serviceName}`;
+    let shared = sharedWatches.get(key);
+    if (!shared) {
+      shared = new SharedEndpointsWatch(key, namespace, serviceName);
+      sharedWatches.set(key, shared);
+    }
+    shared.subscribe(subscriber);
+    return shared;
+  }
+
+  private constructor(private readonly key: string, private readonly namespace: string, private readonly serviceName: string) {
+    // watch endpoints by namespace and service name
+    this.informer = k8s.makeInformer(
+      kc,
+      `/api/v1/namespaces/${namespace}/endpoints?fieldSelector=${FieldSelectorPrefix}${serviceName}`, // makeInformer not support fieldSelector as params for now
+      () => this.fetchEndpoints()
+    );
+
+    // Seen in prod: `TypeError: this.request.removeAllListeners is not a
+    // function` thrown from cache.js:92. request@2 copies every non-reserved
+    // option key onto the Request instance, and `removeAllListeners` is not on
+    // its reserved list, so an option of that name shadows the inherited
+    // EventEmitter method. doneHandler() calls _stop() first and reopens the
+    // watch last, and it runs as a discarded promise (watch.js:72 `done(err)`),
+    // so the throw is uncatchable from here and aborts doneHandler before the
+    // reopen. The informer then stops watching permanently, and because err was
+    // null no "error" event fires, so nothing ever restarts it: the resolver
+    // keeps serving whatever endpoints it last saw, forever.
+    guardInformerStop(this.informer);
+    guardWatchRequestPromise(this.informer);
+
+    for (const type of ["add", "update", "delete"] as const) {
+      this.informer.on(type, (obj) => {
+        this.backoff = undefined;
+        for (const sub of [...this.subscribers]) {
+          sub.onWatchEvent(type, obj);
+        }
+      });
+    }
+
+    // informer will not restart when the under watcher got error
+    // so we restart the informer ourselves
+    this.informer.on("error", (err: any) => {
+      // A stopped informer still emits its final error. Restarting on it
+      // resurrected an informer every channel had already released, which
+      // reopened a watch against the apiserver that nothing would ever close.
+      if (this.stopped) {
+        return;
+      }
+
+      for (const sub of [...this.subscribers]) {
+        sub.onWatchError(err);
+      }
+
+      if (!this.backoff) {
+        this.backoff = backoffFactory.next(null as any);
+      } else {
+        this.backoff = this.backoff.next(null as any) ?? this.backoff;
+      }
+
+      // JSON.stringify of an Error yields "{}"; log the object itself.
+      console.error(`[K8sResolver] informer error event for ${this.key}, will restart informer, backoff duration: ${this.backoff?.duration() || 0}, err:`, err);
+      // Two errors inside one backoff window each scheduled their own restart:
+      // the second setTimeout overwrote this.restartTimer without clearing the
+      // first, so both fired. release() then only knew about the last one.
+      if (this.restartTimer) {
+        clearTimeout(this.restartTimer);
+      }
+      this.restartTimer = setTimeout(() => {
+        this.restartTimer = undefined;
+        this.queueStart();
+      }, this.backoff?.duration() || 0);
+    });
+
+    this.queueStart();
+  }
+
+  private subscribe(subscriber: EndpointsWatchSubscriber) {
+    this.subscribers.add(subscriber);
+    // A channel joining a watch that is already running missed the adds that
+    // built the cache, and a quiet service may not send another event for
+    // hours. Replay the cache so it can upgrade off DNS straight away. For the
+    // first subscriber the informer has not started and the cache is empty.
+    const cached = (this.informer as { list?: () => k8s.V1Endpoints[] }).list?.() || [];
+    for (const obj of cached) {
+      subscriber.onWatchEvent("add", obj);
+    }
+  }
+
+  release(subscriber: EndpointsWatchSubscriber) {
+    this.subscribers.delete(subscriber);
+    if (this.subscribers.size > 0 || this.stopped) {
+      return;
+    }
+
+    this.stopped = true;
+    if (sharedWatches.get(this.key) === this) {
+      sharedWatches.delete(this.key);
+    }
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = undefined;
+    }
+    this.informer.stop().catch((err) => console.error(`[K8sResolver] informer stop error`, err));
+  }
+
+  // Starts must never overlap. ListWatch.start() runs a doneHandler chain that
+  // ends by assigning the single `request` field, so two concurrent chains open
+  // two apiserver watches and only the last one is reachable by _stop(): the
+  // loser leaks for the life of the process and keeps delivering events to
+  // subscribers that believe there is one watch. Chaining rather than dropping
+  // the request keeps a restart that arrives while a start is still in flight.
+  private queueStart() {
+    this.restart = this.restart
+      .catch(() => undefined)
+      .then(() => (this.stopped ? undefined : this.informer.start()));
+    this.restart.catch((err) => console.error(`[K8sResolver] Error`, err));
+  }
+
+  private async fetchEndpoints(): Promise<{
+    response: http.IncomingMessage;
+    body: k8s.V1EndpointsList;
+  }> {
+    try {
+      const r = await k8sApi.listNamespacedEndpoints(this.namespace, undefined, undefined, undefined, `${FieldSelectorPrefix}${this.serviceName}`);
+      return r;
+    } catch (err) {
+      console.error(`[K8sResolver] fetchEndpoints error`, err);
+      // Retrying forever kept the promise chain, and so the released watch,
+      // alive for the life of the process whenever the apiserver stayed
+      // unreachable. Stop retrying once stopped, but never reject: this is
+      // the informer's listFn, awaited inside ListWatch.doneHandler, which the
+      // watch layer invokes as a discarded promise. A rejection there has no
+      // catch anywhere in the process and surfaces as an unhandledRejection,
+      // which Node exits on. Resolve with an empty list instead.
+      //
+      // This is not inert: an in-flight doneHandler continues past the list step
+      // and can open one more watch at cache.js:132 that the already-completed
+      // _stop() will not abort. That is bounded to a single watch per released
+      // informer, and nothing is subscribed to its events any more, so it is
+      // strictly better than exiting the process. `metadata` must be present:
+      // doneHandler reads `list.metadata.resourceVersion` without a guard.
+      if (this.stopped) {
+        return {
+          response: undefined as unknown as http.IncomingMessage,
+          body: { items: [], metadata: {} } as k8s.V1EndpointsList,
+        };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      return this.fetchEndpoints();
+    }
+  }
+}
+
+export class K8sResolover implements Resolver, EndpointsWatchSubscriber {
   private error: StatusObject | null = null;
   private defaultResolutionError: StatusObject | undefined;
 
@@ -165,15 +343,11 @@ export class K8sResolover implements Resolver {
   private port: number | undefined;
   private serviceName: string | undefined;
   private addresses = new Set<string>();
-  private informer: k8s.Informer<k8s.V1Endpoints> | undefined;
+  private sharedWatch: SharedEndpointsWatch | undefined;
 
-  // backoff is use for reconnecting
-  private backoff: IBackoff<IRetryBackoffContext<unknown>> | undefined;
   private dnsResolver: Resolver | undefined;
   private useDnsResolver = true;
   private destroyed = false;
-  private restart: Promise<void> = Promise.resolve();
-  private restartTimer: NodeJS.Timeout | undefined;
   private livenessTimer: NodeJS.Timeout | undefined;
   private relistInFlight = false;
   private lastInformerEventAt = Date.now();
@@ -257,10 +431,6 @@ export class K8sResolover implements Resolver {
     // endpoints, so returning early here left the informer, its watch
     // connection to the apiserver and the poll loop in watch() running for the
     // life of the process on every channel closed before it upgraded.
-    if (this.restartTimer) {
-      clearTimeout(this.restartTimer);
-      this.restartTimer = undefined;
-    }
     if (this.livenessTimer) {
       clearTimeout(this.livenessTimer);
       this.livenessTimer = undefined;
@@ -268,139 +438,67 @@ export class K8sResolover implements Resolver {
 
     this.dnsResolver?.destroy();
 
-    if (this.informer) {
-      this.informer.stop().catch((err) => console.error(`[K8sResolver] informer stop error`, err));
-      this.informer = undefined;
+    // The last channel to release a service's watch stops its informer.
+    if (this.sharedWatch) {
+      this.sharedWatch.release(this);
+      this.sharedWatch = undefined;
     }
   }
 
-  private async watch() {
-    // watch endpoints by namespace and service name
-    const informer = k8s.makeInformer(
-      kc,
-      `/api/v1/namespaces/${this.namespace}/endpoints?fieldSelector=${FieldSelectorPrefix}${this.serviceName}`, // makeInformer not support fieldSelector as params for now
-      () => this.fetchEndpoints()
-    );
-
-    // Seen in prod: `TypeError: this.request.removeAllListeners is not a
-    // function` thrown from cache.js:92. request@2 copies every non-reserved
-    // option key onto the Request instance, and `removeAllListeners` is not on
-    // its reserved list, so an option of that name shadows the inherited
-    // EventEmitter method. doneHandler() calls _stop() first and reopens the
-    // watch last, and it runs as a discarded promise (watch.js:72 `done(err)`),
-    // so the throw is uncatchable from here and aborts doneHandler before the
-    // reopen. The informer then stops watching permanently, and because err was
-    // null no "error" event fires, so nothing ever restarts it: the resolver
-    // keeps serving whatever endpoints it last saw, forever.
-    guardInformerStop(informer);
-    guardWatchRequestPromise(informer);
-
-    informer.on("add", (obj) => {
-      this.markInformerEvent();
-      this.resetBackoff();
-
-      let changed = false;
-      for (const sub of obj.subsets || []) {
-        for (const point of sub.addresses || []) {
-          if (!this.addresses.has(point.ip)) {
-            this.addresses.add(point.ip);
-            changed = true;
-          }
-        }
-      }
-
-      if (changed) {
-        this.updateResolutionFromAddress();
-      }
-
-      // Never serialise the whole Endpoints object here. This fires on every
-      // endpoint event for every channel, and JSON.stringify runs even when
-      // tracing is off, so a service with churn logs kilobytes per event.
-      this.trace(`informer add event, changed: ${changed}, addresses: ${this.addresses.size}`);
-    });
-
-    informer.on("delete", (obj) => {
-      this.markInformerEvent();
-      this.resetBackoff();
-
-      let changed = false;
-      for (const sub of obj.subsets || []) {
-        for (const point of sub.addresses || []) {
-          if (this.addresses.has(point.ip)) {
-            this.addresses.delete(point.ip);
-            changed = true;
-          }
-        }
-      }
-
-      if (changed) {
-        this.updateResolutionFromAddress();
-      }
-
-      this.trace(`informer delete event, changed: ${changed}, addresses: ${this.addresses.size}`);
-    });
-
-    informer.on("update", (obj) => {
-      this.markInformerEvent();
-      this.resetBackoff();
-
+  onWatchEvent(type: "add" | "update" | "delete", obj: k8s.V1Endpoints) {
+    this.markInformerEvent();
+    if (type === "update") {
       if (!obj.subsets || !Array.isArray(obj.subsets)) {
         return;
       }
-
       this.handleFullUpdate(obj.subsets || []);
-
       this.trace(`informer update event, addresses: ${this.addresses.size}`);
-    });
-
-    // informer will not restart when the under watcher got error
-    // so we restart the informer ourselves
-    informer.on("error", (err: any) => {
-      this.markInformerEvent();
-      // A stopped informer still emits its final error. Restarting on it
-      // resurrected an informer the channel had already destroyed, which
-      // reopened a watch against the apiserver that nothing would ever close.
-      if (this.destroyed) {
-        return;
-      }
-
-      if (this.defaultResolutionError) {
-        notifyError(this.listener, this.defaultResolutionError);
-      }
-
-      if (!this.backoff) {
-        this.backoff = backoffFactory.next(null as any);
-      } else {
-        this.backoff = this.backoff.next(null as any) ?? this.backoff;
-      }
-
-      this.trace(`informer error event, will restart informer, backoff duration: ${this.backoff?.duration() || 0}`);
-
-      // JSON.stringify of an Error yields "{}"; log the object itself.
-      console.error(`[K8sResolver] informer error event, will restart informer, backoff duration: ${this.backoff?.duration() || 0}, err:`, err);
-      // Two errors inside one backoff window each scheduled their own restart:
-      // the second setTimeout overwrote this.restartTimer without clearing the
-      // first, so both fired. destroy() then only knew about the last one.
-      if (this.restartTimer) {
-        clearTimeout(this.restartTimer);
-      }
-      this.restartTimer = setTimeout(() => {
-        this.restartTimer = undefined;
-        this.queueStart(informer);
-      }, this.backoff?.duration() || 0);
-    });
-
-    // destroy() can land while the initial endpoints list above is in flight,
-    // before this.informer is set, which would leave this informer running with
-    // nothing holding a reference to stop it.
-    if (this.destroyed) {
       return;
     }
 
-    this.informer = informer;
-    this.scheduleLivenessCheck();
+    let changed = false;
+    for (const sub of obj.subsets || []) {
+      for (const point of sub.addresses || []) {
+        if (type === "add" && !this.addresses.has(point.ip)) {
+          this.addresses.add(point.ip);
+          changed = true;
+        } else if (type === "delete" && this.addresses.has(point.ip)) {
+          this.addresses.delete(point.ip);
+          changed = true;
+        }
+      }
+    }
 
-    this.queueStart(informer);
+    if (changed) {
+      this.updateResolutionFromAddress();
+    }
+
+    // Never serialise the whole Endpoints object here. This fires on every
+    // endpoint event for every channel, and JSON.stringify runs even when
+    // tracing is off, so a service with churn logs kilobytes per event.
+    this.trace(`informer ${type} event, changed: ${changed}, addresses: ${this.addresses.size}`);
+  }
+
+  onWatchError(_err: unknown) {
+    this.markInformerEvent();
+    if (this.destroyed) {
+      return;
+    }
+    if (this.defaultResolutionError) {
+      notifyError(this.listener, this.defaultResolutionError);
+    }
+    this.trace(`informer error event, shared watch will restart the informer`);
+  }
+
+  private async watch() {
+    // destroy() can land while the initial endpoints list in the constructor is
+    // in flight, which would acquire a watch that nothing ever releases.
+    if (this.destroyed || !this.serviceName) {
+      return;
+    }
+
+    this.sharedWatch = SharedEndpointsWatch.acquire(this.namespace, this.serviceName, this);
+    this.scheduleLivenessCheck();
 
     // Bounded by destroy(): without it this loop kept a 1s timer alive forever
     // on every channel that was closed before its first endpoint arrived.
@@ -535,19 +633,6 @@ export class K8sResolover implements Resolver {
     this.lastStalenessAlarmAt = 0;
   }
 
-  // Starts must never overlap. ListWatch.start() runs a doneHandler chain that
-  // ends by assigning the single `request` field, so two concurrent chains open
-  // two apiserver watches and only the last one is reachable by _stop(): the
-  // loser leaks for the life of the process and keeps delivering events into a
-  // resolver that believes it has one watch. Chaining rather than dropping the
-  // request keeps a restart that arrives while a start is still in flight.
-  private queueStart(informer: k8s.Informer<k8s.V1Endpoints>) {
-    this.restart = this.restart
-      .catch(() => undefined)
-      .then(() => (this.destroyed ? undefined : informer.start()));
-    this.restart.catch((err) => console.error(`[K8sResolver] Error`, err));
-  }
-
   private updateResolutionFromAddress() {
     // A stopped informer still drains its cache: the final list resolves empty,
     // ListWatch fires a delete for every endpoint it held, and those handlers
@@ -574,41 +659,6 @@ export class K8sResolover implements Resolver {
         })),
       },
     ];
-  }
-
-  private async fetchEndpoints(): Promise<{
-    response: http.IncomingMessage;
-    body: k8s.V1EndpointsList;
-  }> {
-    try {
-      const r = await k8sApi.listNamespacedEndpoints(this.namespace, undefined, undefined, undefined, `${FieldSelectorPrefix}${this.serviceName}`);
-      return r;
-    } catch (err) {
-      console.error(`[K8sResolver] fetchEndpoints error`, err);
-      // Retrying forever kept the promise chain, and so the destroyed resolver,
-      // alive for the life of the process whenever the apiserver stayed
-      // unreachable. Stop retrying once destroyed, but never reject: this is
-      // the informer's listFn, awaited inside ListWatch.doneHandler, which the
-      // watch layer invokes as a discarded promise. A rejection there has no
-      // catch anywhere in the process and surfaces as an unhandledRejection,
-      // which Node exits on. Resolve with an empty list instead.
-      //
-      // This is not inert: an in-flight doneHandler continues past the list step
-      // and can open one more watch at cache.js:132 that the already-completed
-      // _stop() will not abort. That is bounded to a single watch per destroyed
-      // resolver, and its events are dropped because updateResolutionFromAddress()
-      // ignores a destroyed resolver, so it is strictly better than exiting the
-      // process. `metadata` must be present: doneHandler reads
-      // `list.metadata.resourceVersion` without a guard.
-      if (this.destroyed) {
-        return {
-          response: undefined as unknown as http.IncomingMessage,
-          body: { items: [], metadata: {} } as k8s.V1EndpointsList,
-        };
-      }
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      return this.fetchEndpoints();
-    }
   }
 
   private handleFullUpdate(subsets: k8s.V1EndpointSubset[]) {
@@ -644,10 +694,6 @@ export class K8sResolover implements Resolver {
 
   private trace(msg: string) {
     logging.trace(LogVerbosity.DEBUG, TRACER_NAME, `Target ${uriToString(this.target)} ${msg}`);
-  }
-
-  private resetBackoff() {
-    this.backoff = undefined;
   }
 
   static getDefaultAuthority(target: GrpcUri): string {
