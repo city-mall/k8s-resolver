@@ -568,6 +568,66 @@ async function testDestroyReleasesDnsFallbackAfterUpgrade() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Sentry FLOW-6X: every channel opened its own apiserver watch, so N channels
+// to one service meant N identical watches, all reopening together after a
+// blip and getting 429'd. Channels to one service must share one informer.
+// ---------------------------------------------------------------------------
+async function testChannelsToOneServiceShareOneWatch() {
+  informers.length = 0;
+  const a = newResolver();
+  const b = newResolver();
+  const other = newResolver("other:1234");
+  await sleep(100);
+
+  assert.strictEqual(informers.length, 2, `${informers.length} informers for 2 services; channels to one service must share a watch`);
+  const inf = informers[0];
+
+  apiEndpointIps = ["10.0.0.1"];
+  inf.emit("add", { subsets: [{ addresses: [{ ip: "10.0.0.1" }] }] });
+  await sleep(50);
+  assert.ok(a.seen.ok.length >= 1 && b.seen.ok.length >= 1, "an event on the shared watch must reach every channel");
+
+  // One error must schedule exactly one restart, not one per channel.
+  const startsBefore = inf.starts;
+  inf.emit("error", new Error("Too Many Requests"));
+  await sleep(1500);
+  assert.strictEqual(inf.starts - startsBefore, 1, `one watch error restarted the informer ${inf.starts - startsBefore} times`);
+  assert.ok(a.seen.err.length >= 1 && b.seen.err.length >= 1, "a watch error must still be reported to every channel");
+
+  a.resolver.destroy();
+  await sleep(20);
+  assert.strictEqual(inf.stops, 0, "releasing one channel must not stop a watch another channel still uses");
+  b.resolver.destroy();
+  await sleep(20);
+  assert.strictEqual(inf.stops, 1, "the last channel to release a watch must stop it");
+
+  // A later channel to the same service must get a fresh watch, not the stopped one.
+  const c = newResolver();
+  await sleep(100);
+  assert.strictEqual(informers.length, 3, "a service whose watch was released must open a new one");
+  c.resolver.destroy();
+  other.resolver.destroy();
+  apiEndpointIps = [];
+  await sleep(20);
+}
+
+async function testLateChannelGetsCachedEndpoints() {
+  informers.length = 0;
+  const a = newResolver();
+  await sleep(100);
+  const inf = informers[0];
+  inf.list = () => [{ subsets: [{ addresses: [{ ip: "10.0.0.9" }] }] }];
+
+  const b = newResolver();
+  await sleep(100);
+  assert.strictEqual(informers.length, 1, "precondition: the late channel joined the existing watch");
+  assert.ok(b.seen.ok.length >= 1, "a channel joining a running watch must be replayed its cache, a quiet service may never send another event");
+  a.resolver.destroy();
+  b.resolver.destroy();
+  await sleep(20);
+}
+
 async function testStartsNeverOverlap() {
   informers.length = 0;
   const { resolver } = newResolver();
@@ -579,10 +639,11 @@ async function testStartsNeverOverlap() {
     release = r;
   });
 
-  // Both paths that produce a start in prod: the initial one from watch() and a
-  // restart from the error handler, arriving while the first is still in flight.
-  resolver.queueStart(inf);
-  resolver.queueStart(inf);
+  // Both paths that produce a start in prod: the initial one and a restart
+  // from the error handler, arriving while the first is still in flight. The
+  // start chain now lives on the per-service shared watch.
+  resolver.sharedWatch.queueStart();
+  resolver.sharedWatch.queueStart();
   await sleep(150);
 
   assert.strictEqual(
@@ -744,6 +805,8 @@ const tests = [
   testPeriodicRelistIsCachedAndBounded,
   testDestroyReleasesDnsFallbackAfterUpgrade,
   testStartsNeverOverlap,
+  testChannelsToOneServiceShareOneWatch,
+  testLateChannelGetsCachedEndpoints,
   testEventsAfterDestroyDoNotNotifyListener,
 ];
 
